@@ -917,8 +917,19 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     proj_name = payload.get("project_name", "프로젝트")
 
     context        = payload.get("context", "")
+    proj_context   = payload.get("project_context", "")  # PPV 탭 프로젝트 메타데이터
     lang           = payload.get("lang", "en")
-    mode           = payload.get("mode", "full")  # full=IC Opinion, interp=CF 해석
+    mode           = payload.get("mode", "full")
+    proj_meta      = payload.get("project_meta", {})
+    stage    = proj_meta.get("stage", "")
+    iso      = proj_meta.get("iso", "")
+    proj_type= proj_meta.get("type", "")
+    ntp_date = proj_meta.get("ntp", "")
+    cod_date = proj_meta.get("cod", "")
+    risk_pct = proj_meta.get("risk_factor", "")
+    if risk_pct != "": risk_pct = f"{float(risk_pct)*100:.0f}%"
+    itc_risk = proj_meta.get("itc_expiry_risk", "")
+    proj_ctx = proj_meta.get("proj_ctx", "")
     thresholds     = payload.get("thresholds", {})
     current_metrics= payload.get("current_metrics", {})
 
@@ -943,13 +954,14 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         )
     else:
         prompt = (
-        "You are a senior investment professional at a top-tier infrastructure fund "
-        "(Goldman Sachs Infrastructure / Macquarie / Brookfield quality). "
-        "This developer's business model is 100% develop-and-sell. "
-        "Evaluate this US solar+BESS project against the firm's investment thresholds "
-        "and deliver a final IC-grade investment decision memo.\n\n"
+        "You are the head of Investment Committee at Hanwha Energy USA (HEUH), "
+        "a renewable energy developer whose sole business model is: develop → sell at NTP. "
+        "The IC decision: should we continue spending development capital on this project? "
+        "Key context: the US ITC expires July 4 2026 for new starts (safe harbor via MPT purchase extends eligibility). "
+        "Your judgment must cover BOTH (A) development risk and (B) exit attractiveness.\n\n"
         f"PROJECT: {proj_name} | Size: {pv_mwac} MWac\n"
         f"FINANCIAL SUMMARY: {context}\n"
+        f"PROJECT METADATA: {proj_ctx}\n"
         f"ANNUAL SPONSOR CF (Y1-Y10): {cf_text}\n\n"
         "=== FIRM INVESTMENT THRESHOLDS ===\n"
         f"  Minimum Dev Margin : {margin_thr} c/Wp\n"
@@ -960,21 +972,29 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         f"  Sponsor IRR: {curr_irr}%\n"
         f"  ITC Rate   : {curr_itc}%\n"
         f"  PPA Term   : {ppa_term} yrs | Toll Term: {toll_term} yrs\n\n"
-        "REQUIRED ANALYSIS:\n"
-        "1. THRESHOLD CHECK — state pass/fail and exact gap for each\n"
-        "2. VERDICT LOGIC (follow strictly):\n"
-        "   - If ALL thresholds pass: verdict = PROCEED (default). "
-        "     Only downgrade to RECUT if there is a Critical risk that fundamentally changes the return profile.\n"
-        "   - If ANY threshold fails: verdict = RECUT, state exactly what needs to change\n"
-        "   - PASS only if IRR is below threshold AND margin cannot recover it\n"
-        "   Thresholds passing with good headroom is a STRONG positive signal. Do not bury it.\n"
-        "3. DEV MARGIN SENSITIVITY (required):\n"
-        "   - Upside: max dev margin (c/Wp) maintainable before IRR drops to threshold\n"
-        "   - Downside: min dev margin (c/Wp) at IRR = threshold (if applicable)\n"
-        "   - Express as: 'Current 20c/Wp has Xc/Wp upside to Yc/Wp before IRR hits threshold'\n"
-        "4. RISK ASSESSMENT — only 3-4 most material risks. Score Critical/Watch/OK:\n"
-        "   Focus on: ITC adder eligibility, BESS toll renewal, merchant tail, FEOC\n"
-        "   Do NOT list risks that are standard/expected for this asset class as Critical\n"
+        "REQUIRED ANALYSIS (all in one unified IC memo):\n"
+        "\n"
+        "A. FINANCIAL THRESHOLDS\n"
+        "   Check each threshold — pass/fail with exact gap.\n"
+        "   Dev Margin Sensitivity: 'Current Xc/Wp → upside to Yc/Wp / downside floor Zc/Wp'\n"
+        "\n"
+        "B. DEVELOPMENT RISK (use your 2025 market knowledge)\n"
+        "   1. ITC / Safe Harbor risk:\n"
+        "      - Given NTP year and COD year, is COD achievable before ITC sunset (July 4 2026 for new starts)?\n"
+        "      - If COD year > 2026, has safe harbor (MPT: 5% module deposit) been completed? "
+        "        Assume yes if ntp_year <= 2026, flag as Watch if 2027+\n"
+        "   2. EPC price adequacy: given $/Wdc implied by CAPEX and project size, "
+        "      compare to 2025 US utility-scale solar+BESS market range ($0.9-1.2/Wdc PV, $350-450/kWh BESS). "
+        "      Flag if outlier.\n"
+        "   3. ISO / grid risk: based on ISO and state, note interconnection queue depth "
+        "      and any known congestion or curtailment risk (use 2025 market knowledge).\n"
+        "   4. PPA market: is the contracted PPA price competitive vs 2025 P25 market for this ISO?\n"
+        "\n"
+        "C. VERDICT LOGIC (strict):\n"
+        "   PROCEED: all financial thresholds pass AND no Critical development risk\n"
+        "   RECUT: threshold miss OR one Critical development risk fixable by sponsor\n"
+        "   PASS: IRR unrecoverable OR Critical development risk not fixable\n"
+        "   Headroom above threshold is a STRONG positive — say so explicitly.\n"
         f"Respond in {'English' if payload.get('lang','en')=='en' else 'Korean'} only.\n"
         "Be direct. Cite specific numbers. No hedging.\n\n"
         "Respond ONLY with valid JSON (no markdown, no code blocks).\n"
@@ -982,8 +1002,10 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "verdict: PROCEED / RECUT / PASS\n"
         "verdict_color: green / amber / red\n"
         "threshold_status: {irr_ok:bool, irr_gap:str, margin_ok:bool, margin_gap:str, itc_ok:bool}\n"
+        "dev_ic: {ntp_prob:str, itc_expiry_verdict:str, safe_harbor:str, stage_ok:str}\n"
         "metrics: one-line key metrics string\n"
-        "sensitivity: dev margin upside/downside analysis with c/Wp numbers\n"
+        "sensitivity_en: dev margin upside/downside in English with c/Wp numbers\n"
+        "sensitivity_kr: same in Korean\n"
         "thesis: 3-4 sentence investment thesis\n"
         "risks: array of {title:str, severity:Critical|Watch|OK, detail:str}\n"
         "rec: 2-3 sentence actionable recommendation\n"
