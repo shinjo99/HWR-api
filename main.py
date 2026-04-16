@@ -4,6 +4,32 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 MACRS_5YR = [0.20, 0.32, 0.192, 0.1152, 0.1152, 0.0576]
+
+def _irr_robust(cfs, guess=0.08):
+    """여러 초기값으로 Newton 반복 → 양수 수렴값 반환"""
+    import numpy as np
+    def newton(g):
+        r = g
+        for _ in range(2000):
+            npv  = sum(cf/(1+r)**t for t,cf in enumerate(cfs))
+            dnpv = sum(-t*cf/(1+r)**(t+1) for t,cf in enumerate(cfs))
+            if abs(dnpv) < 1e-12: break
+            r_new = r - npv/dnpv
+            if r_new <= -0.999: r_new = 0.001
+            if abs(r_new - r) < 1e-8: return r_new
+            r = r_new
+        return r
+    for g in [guess, 0.01, 0.03, 0.05, 0.10, 0.15]:
+        r = newton(g)
+        if r > 0:
+            chk = sum(cf/(1+r)**t for t,cf in enumerate(cfs))
+            if abs(chk) < 500:  # $500K 오차 허용
+                return r
+    try:
+        r0 = float(npf.irr(cfs))
+        return r0 if not np.isnan(r0) else 0.0
+    except Exception:
+        return 0.0
 import requests
 import jwt
 import os
@@ -390,7 +416,7 @@ def _calc_engine(inputs: dict) -> dict:
     aug_cost_ea=aug_mwh_ea*aug_price
 
     # Full 35-year CF schedule
-    cashflows=[- total_capex]; unlev_cfs=[-total_capex]; sponsor_cfs=[-effective_eq]
+    cashflows=[-effective_eq]; unlev_cfs=[-total_capex]; sponsor_cfs=[-effective_eq]; pretax_cfs=[-effective_eq]
     debt_bal=debt; detail=[]; ebitda_yr1=None
 
     for yr in range(1, life+1):
@@ -445,15 +471,16 @@ def _calc_engine(inputs: dict) -> dict:
         else:
             s_cf = op_cf*(1-post_flip_cash_te) + s_tax
 
-        cashflows.append(op_cf); unlev_cfs.append(ebitda-aug_c); sponsor_cfs.append(s_cf)
+        s_cf_pretax = op_cf*(1-pre_flip_cash_te) if yr<=flip_term else op_cf*(1-post_flip_cash_te)
+        cashflows.append(op_cf); unlev_cfs.append(ebitda-aug_c); sponsor_cfs.append(s_cf); pretax_cfs.append(s_cf_pretax)
         if yr<=10:
             detail.append({'yr':yr,'rev':round(total_rev,0),'opex':round(opex,0),
                 'ebitda':round(ebitda,0),'ds':round(ds,0),'aug':round(aug_c,0),
                 'depr':round(depr,0),'s_cf':round(s_cf,0)})
 
-    lirr = float(npf.irr(cashflows))
-    uirr = float(npf.irr(unlev_cfs))
-    sirr = float(npf.irr(sponsor_cfs))
+    lirr = _irr_robust(pretax_cfs, guess=0.10)   # Sponsor pretax levered (Neptune Row 26 ~10%)
+    uirr = _irr_robust(unlev_cfs, guess=0.05)    # Asset-level unlevered (Neptune Row 27 ~8%)
+    sirr = _irr_robust(sponsor_cfs, guess=0.10)  # Sponsor after-tax w/ MACRS
     sirr_c = float(npf.irr(sponsor_cfs[:ppa_term+1]))
     ebitda_yield = ebitda_yr1/total_capex*100 if total_capex else 0
 
