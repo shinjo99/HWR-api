@@ -965,25 +965,15 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "4. Verdict: PROCEED / RECUT / PASS\n\n"
         "Deliver in BOTH English (Goldman IC memo style) AND Korean (top Korean infra fund style).\n"
         "Be direct. Cite specific numbers. No hedging.\n\n"
-        "Respond ONLY with this JSON:\n"
-        "{"
-        "\"verdict\": \"PROCEED|RECUT|PASS\","
-        "\"verdict_color\": \"green|amber|red\","
-        "\"threshold_status\": {"
-        "  \"irr_ok\": true/false, \"irr_gap\": \"e.g. +0.92% above threshold\","
-        "  \"margin_ok\": true/false, \"margin_gap\": \"e.g. +10c/Wp above threshold\","
-        "  \"itc_ok\": true/false"
-        "},"
-        "\"metrics\": \"one-liner with key numbers\","
-        "\"sensitivity_en\": \"Dev Margin upside/downside analysis with specific c/Wp numbers\","
-        "\"sensitivity_kr\": \"Korean version\","
-        "\"thesis_en\": \"3-4 sentences. Investment thesis for IC committee.\","
-        "\"thesis_kr\": \"Korean version\","
-        "\"risks_en\": [{{\"title\":\"\",\"severity\":\"Critical|Watch|OK\",\"detail\":\"one sentence\"}}],"
-        "\"risks_kr\": [{{\"title\":\"\",\"severity\":\"Critical|Watch|양호\",\"detail\":\"한 문장\"}}],"
-        "\"rec_en\": \"2-3 sentences. What to do NOW.\","
-        "\"rec_kr\": \"행동 권고\""
-        "}"
+        "Respond ONLY with valid JSON (no markdown, no code blocks):\n"
+        "Keys required: verdict, verdict_color, threshold_status, metrics, "
+        "sensitivity_en, sensitivity_kr, thesis_en, thesis_kr, "
+        "risks_en, risks_kr, rec_en, rec_kr\n"
+        "verdict: one of PROCEED / RECUT / PASS\n"
+        "verdict_color: one of green / amber / red\n"
+        "threshold_status: object with irr_ok(bool), irr_gap(str), margin_ok(bool), margin_gap(str), itc_ok(bool)\n"
+        "risks_en and risks_kr: arrays of objects with title, severity(Critical/Watch/OK), detail\n"
+        "All string values must use double quotes. No trailing commas."
     )
 
     resp = requests.post(
@@ -995,17 +985,28 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         },
         json={
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1000,
+            "max_tokens": 2500,
             "messages": [{"role": "user", "content": prompt}]
         },
-        timeout=30
+        timeout=45
     )
     if resp.status_code != 200:
         raise HTTPException(500, f"Claude API 오류: {resp.text[:200]}")
 
     data = resp.json()
     text = "".join(b.get("text","") for b in data.get("content",[]))
-    clean = text.replace("```json","").replace("```","").strip()
+
+    # JSON 정제 — 코드블록, 줄바꿈, 특수문자 처리
+    import re as _re
+    clean = text.strip()
+    clean = _re.sub(r"```(?:json)?\s*", "", clean).strip()
+    clean = clean.strip("`")
+    # { ... } 범위만 추출
+    start = clean.find("{")
+    end   = clean.rfind("}") + 1
+    if start >= 0 and end > start:
+        clean = clean[start:end]
+
     return {"ok": True, "result": clean}
 
 
