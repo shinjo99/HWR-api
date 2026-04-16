@@ -3,3 +3,5 @@ uvicorn==0.29.0
 pyjwt==2.8.0
 requests==2.31.0
 pydantic==2.7.0
+pyxlsb==1.0.10
+python-multipart==0.0.9
