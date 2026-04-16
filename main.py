@@ -335,10 +335,13 @@ def _calc_engine(inputs: dict) -> dict:
     ann_ds     = float(npf.pmt(int_rate, loan_term, -debt)) if debt > 0 else 0
 
     # TE Flip
-    flip_yield = inputs.get('flip_yield', 8.75) / 100
+    _fy_raw = inputs.get('flip_yield', 8.75)
+    if _fy_raw > 50: _fy_raw = _fy_raw / 100   # 875 → 8.75 자동 보정
+    flip_yield = _fy_raw / 100
     flip_term  = int(inputs.get('flip_term', 7))
     itc_elig   = inputs.get('itc_elig', 97) / 100
-    itc_rate   = inputs.get('itc_rate', 30) / 100
+    itc_rate   = inputs.get('itc_rate') or inputs.get('credit_val', 30)
+    itc_rate   = itc_rate / 100
     te_mult    = inputs.get('te_mult', 1.115)
     yield_adj  = 1 / (1 + (flip_yield - 0.0875) * 8)
     te_invest  = min(total_capex * itc_elig * itc_rate * te_mult * yield_adj, total_capex * 0.36)
