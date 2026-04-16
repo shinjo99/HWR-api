@@ -432,6 +432,16 @@ def parse_pf_model(filepath: str) -> dict:
         except Exception:
             pass
 
+    # bess_mwh 보정: xlsb hex 파싱 한계 → pv_mwac × duration(숫자)으로 계산
+    try:
+        duration_str = assumptions.get("bess_duration", "")
+        duration_h = float("".join(x for x in str(duration_str) if x.isdigit() or x=="."))
+        pv_mwac = assumptions.get("pv_mwac") or assumptions.get("bess_mw")
+        if pv_mwac and duration_h:
+            assumptions["bess_mwh"] = round(float(pv_mwac) * duration_h, 1)
+    except Exception:
+        pass
+
     return {"assumptions": assumptions, "outputs": outputs}
 
 
