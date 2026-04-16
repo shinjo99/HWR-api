@@ -271,6 +271,224 @@ def get_dashboard(user=Depends(get_current_user)):
         "atlas": fb_read("atlas"),
     }
 
+
+# ══════════════════════════════════════════════════
+#  Valuation Calculate (Stage 1 Engine)
+# ══════════════════════════════════════════════════
+import numpy as np
+import numpy_financial as npf
+
+def _calc_engine(inputs: dict) -> dict:
+    pv_mwac   = inputs.get('pv_mwac', 199)
+    pv_mwdc   = pv_mwac * inputs.get('dc_ac_ratio', 1.34)
+    bess_mw   = inputs.get('bess_mw', 199)
+    bess_mwh  = inputs.get('bess_mwh', 796)
+    life      = int(inputs.get('life', 35))
+
+    # CAPEX
+    module_cwp   = inputs.get('module_cwp', 31.5)
+    bos_cwp      = inputs.get('bos_cwp', 42.9)
+    ess_per_kwh  = inputs.get('ess_per_kwh', 234.5)
+    epc_cont_pct = inputs.get('epc_cont_pct', 8.0)
+    owner_pct    = inputs.get('owner_pct', 3.0)
+    softcost_pct = inputs.get('softcost_pct', 5.0)
+    intercon_m   = inputs.get('intercon_m', 120.0)
+    dev_cost_m   = inputs.get('dev_cost_m', 20.0)
+    capex_etc    = inputs.get('capex_etc', 0)
+
+    pv_module = pv_mwdc*1000*module_cwp/100
+    pv_bos    = pv_mwdc*1000*bos_cwp/100
+    ess_equip = bess_mwh*ess_per_kwh
+    epc_base  = pv_module + pv_bos + ess_equip
+    epc_total = epc_base * (1 + epc_cont_pct/100)
+    pre_capex = (epc_total*(1+owner_pct/100+softcost_pct/100)
+                 + intercon_m*1000 + dev_cost_m*1000 + capex_etc*1000)
+    int_rate   = inputs.get('int_rate', 5.5) / 100
+    debt_ratio = inputs.get('debt_ratio', 47.6) / 100
+    base_capex = pre_capex * (1 + debt_ratio*int_rate*0.75 + 0.012)
+    total_capex = float(inputs['capex_total_override'])*1000 if inputs.get('capex_total_override') else base_capex
+
+    dev_margin  = pv_mwac*1000*inputs.get('dev_margin_kwac', 200)/1000
+    epc_margin  = epc_base * inputs.get('epc_margin_pct', 7.95)/100
+    total_margin = dev_margin + epc_margin
+
+    loan_term  = int(inputs.get('loan_term', 18))
+    debt       = total_capex * debt_ratio
+    ann_ds     = float(npf.pmt(int_rate, loan_term, -debt)) if debt > 0 else 0
+
+    # TE Flip
+    flip_yield = inputs.get('flip_yield', 8.75) / 100
+    flip_term  = int(inputs.get('flip_term', 7))
+    itc_elig   = inputs.get('itc_elig', 97) / 100
+    itc_rate   = inputs.get('itc_rate', 30) / 100
+    te_mult    = inputs.get('te_mult', 1.115)
+    yield_adj  = 1 / (1 + (flip_yield - 0.0875) * 8)
+    te_invest  = min(total_capex * itc_elig * itc_rate * te_mult * yield_adj, total_capex * 0.36)
+    sponsor_eq = total_capex - debt - te_invest
+    effective_eq = sponsor_eq * (1 - int_rate * 0.75)
+
+    # MACRS depreciation
+    tax_rate    = inputs.get('tax_rate', 21) / 100
+    macrs_basis = total_capex * itc_elig * (1 - itc_rate/2)
+    depr_sched  = {i+1: macrs_basis*r for i,r in enumerate(MACRS_5YR)}
+    depr_share  = inputs.get('depr_share', 0.7721)  # calibrated to Neptune
+
+    # Cash allocation
+    pre_flip_cash_te  = inputs.get('pre_flip_cash_te', 25) / 100
+    post_flip_cash_te = inputs.get('post_flip_cash_te', 5) / 100
+
+    # Revenue
+    cf_pct       = inputs.get('cf_pct', 21.24)
+    net_prod_yr1 = inputs.get('net_prod_yr1', None)
+    ann_prod_yr1 = float(net_prod_yr1) if net_prod_yr1 else pv_mwac*cf_pct/100*8760
+    ppa_price   = inputs.get('ppa_price', 68.82)
+    ppa_term    = int(inputs.get('ppa_term', 25))
+    ppa_esc     = inputs.get('ppa_esc', 0) / 100
+    # bess_toll: CF_Annual Y1 실제값 우선, 없으면 Summary 파싱값
+    bess_toll   = inputs.get('bess_toll_y1_effective') or inputs.get('bess_toll', 14.50)
+    bess_toll_t = int(inputs.get('bess_toll_term', 20))
+    merch_ppa   = inputs.get('merchant_ppa', 45.0)
+    merch_esc   = inputs.get('merchant_esc', 3.0) / 100
+    degradation = inputs.get('degradation', 0.0064)
+    avail_1     = inputs.get('availability_yr1', 0.977)
+    avail_2     = inputs.get('availability_yr2', 0.982)
+
+    # OPEX
+    pv_om=inputs.get('pv_om',4.5); pv_om_nc=inputs.get('pv_om_nc',1.0)
+    pv_aux=inputs.get('pv_aux',1.56); bess_om=inputs.get('bess_om',8.64)
+    bess_om_nc=inputs.get('bess_om_nc',1.0); bess_aux=inputs.get('bess_aux',3.84)
+    ins_pv=inputs.get('insurance_pv',10.57); ins_bess=inputs.get('insurance_bess',5.05)
+    asset_mgmt=inputs.get('asset_mgmt',210); prop_tax=inputs.get('prop_tax_yr1',3162)
+    land_rent=inputs.get('land_rent_yr1',437); opex_etc=inputs.get('opex_etc',0)
+    opex_esc=inputs.get('opex_esc',2.0)/100
+
+    # Augmentation
+    aug_price=inputs.get('aug_price',150); aug_mwh_pct=inputs.get('aug_mwh_pct',18.8)
+    aug_mwh_ea=bess_mwh*aug_mwh_pct/100
+    aug_years=[int(y) for y in [inputs.get('aug_y1',4),inputs.get('aug_y2',8),inputs.get('aug_y3',12)] if y and int(y)>0]
+    aug_cost_ea=aug_mwh_ea*aug_price
+
+    # Full 35-year CF schedule
+    cashflows=[- total_capex]; unlev_cfs=[-total_capex]; sponsor_cfs=[-effective_eq]
+    debt_bal=debt; detail=[]; ebitda_yr1=None
+
+    for yr in range(1, life+1):
+        avail = avail_1 if yr==1 else avail_2
+        prod  = ann_prod_yr1 * avail * ((1-degradation)**(yr-1))
+
+        # CF_Annual parsed schedule 우선 사용 (실제 Neptune 모델값)
+        pv_sched   = inputs.get('pv_rev_schedule', [])
+        bess_sched = inputs.get('bess_rev_schedule', [])
+        merch_sched= inputs.get('merch_rev_schedule', [])
+
+        if pv_sched and yr-1 < len(pv_sched):
+            pv_rev = pv_sched[yr-1]
+        elif yr <= ppa_term:
+            pv_rev = prod*ppa_price*((1+ppa_esc)**(yr-1))/1000
+        else:
+            pv_rev = prod*merch_ppa*((1+merch_esc)**(yr-1))/1000
+
+        if bess_sched and yr-1 < len(bess_sched):
+            bess_rev = bess_sched[yr-1]
+        else:
+            bess_rev = bess_mw*1000*bess_toll*12/1000 if yr<=bess_toll_t else 0
+
+        if merch_sched and yr-1 < len(merch_sched) and merch_sched[yr-1] > 0:
+            pv_rev = merch_sched[yr-1]  # merchant 기간은 merch_sched 우선
+
+        total_rev = pv_rev + bess_rev
+
+        esc=(1+opex_esc)**(yr-1); prop_esc=max(0.35,1-0.025*(yr-1))
+        opex=(pv_mwdc*1000*pv_om/1000*esc + pv_mwac*1000*pv_om_nc/1000*esc +
+              pv_mwac*1000*pv_aux/1000*esc + bess_mw*1000*bess_om/1000*esc +
+              bess_mw*1000*bess_om_nc/1000*esc + bess_mw*1000*bess_aux/1000*esc +
+              pv_mwac*1000*ins_pv/1000*esc + bess_mw*1000*ins_bess/1000*esc +
+              asset_mgmt*esc + prop_tax*prop_esc + land_rent*esc + opex_etc*1000*esc)
+
+        ebitda = total_rev - opex
+        if yr==1: ebitda_yr1=ebitda
+        aug_c = aug_cost_ea if yr in aug_years else 0
+
+        if yr<=loan_term and debt_bal>0:
+            int_p=debt_bal*int_rate; prin=ann_ds-int_p
+            ds=ann_ds; debt_bal=max(0,debt_bal-prin)
+        else: ds=0
+
+        # MACRS depreciation tax benefit to sponsor
+        depr = depr_sched.get(yr, 0)
+        s_tax = depr * tax_rate * depr_share  # sponsor keeps depr_share of tax benefit
+
+        op_cf = ebitda - ds - aug_c
+        if yr<=flip_term:
+            s_cf = op_cf*(1-pre_flip_cash_te) + s_tax
+        else:
+            s_cf = op_cf*(1-post_flip_cash_te) + s_tax
+
+        cashflows.append(op_cf); unlev_cfs.append(ebitda-aug_c); sponsor_cfs.append(s_cf)
+        if yr<=10:
+            detail.append({'yr':yr,'rev':round(total_rev,0),'opex':round(opex,0),
+                'ebitda':round(ebitda,0),'ds':round(ds,0),'aug':round(aug_c,0),
+                'depr':round(depr,0),'s_cf':round(s_cf,0)})
+
+    lirr = float(npf.irr(cashflows))
+    uirr = float(npf.irr(unlev_cfs))
+    sirr = float(npf.irr(sponsor_cfs))
+    sirr_c = float(npf.irr(sponsor_cfs[:ppa_term+1]))
+    ebitda_yield = ebitda_yr1/total_capex*100 if total_capex else 0
+
+    return {
+        'capex_total':   round(total_capex,0),
+        'epc_base':      round(epc_base,0),
+        'debt':          round(debt,0),
+        'equity':        round(sponsor_eq+te_invest,0),
+        'te_invest':     round(te_invest,0),
+        'sponsor_equity':round(sponsor_eq,0),
+        'dev_margin':    round(dev_margin,0),
+        'epc_margin':    round(epc_margin,0),
+        'total_margin':  round(total_margin,0),
+        'levered_irr':   round(lirr,6) if not np.isnan(lirr) else None,
+        'unlevered_irr': round(uirr,6) if not np.isnan(uirr) else None,
+        'sponsor_irr':   round(sirr,6) if not np.isnan(sirr) else None,
+        'sponsor_irr_contract': round(sirr_c,6) if not np.isnan(sirr_c) else None,
+        'ebitda_yield':  round(ebitda_yield,2),
+        'aug_cost_ea':   round(aug_cost_ea,0),
+        'annual_detail': detail,
+        'cashflows':     [round(x,0) for x in cashflows[:36]],
+    }
+
+
+@app.post("/valuation/calculate")
+def calculate_valuation(req: ValuationCalcRequest, user=Depends(get_current_user)):
+    """Run PF calculation engine with given inputs"""
+    try:
+        result = _calc_engine(req.inputs)
+        return {"ok": True, "project_id": req.project_id, "result": result}
+    except Exception as e:
+        raise HTTPException(500, f"Calculation error: {str(e)}")
+
+
+@app.get("/valuation/calculate/defaults")
+def get_calc_defaults(user=Depends(get_current_user)):
+    """Return default input values for the calculator"""
+    return {
+        "pv_mwac": 199, "dc_ac_ratio": 1.34,
+        "bess_mw": 199, "bess_mwh": 796,
+        "cf_pct": 21.24, "life": 35,
+        "module_cwp": 31.5, "bos_cwp": 42.9, "ess_per_kwh": 234.5,
+        "epc_cont_pct": 8.0, "owner_pct": 3.0, "softcost_pct": 5.0,
+        "intercon_m": 120.0, "dev_cost_m": 20.0,
+        "dev_margin_kwac": 200, "epc_margin_pct": 7.95,
+        "ppa_price": 68.82, "ppa_term": 25, "ppa_esc": 0,
+        "bess_toll": 13.68, "bess_toll_term": 20, "merchant_ppa": 45.0,
+        "degradation": 0.0064,
+        "pv_om": 4.5, "bess_om": 8.64, "insurance_pv": 10.57,
+        "insurance_bess": 5.05, "asset_mgmt": 210,
+        "prop_tax_yr1": 3162, "land_rent_yr1": 437, "opex_esc": 2.0,
+        "aug_price": 150, "aug_mwh_pct": 18.8, "aug_y1": 4, "aug_y2": 8, "aug_y3": 12,
+        "debt_ratio": 47.6, "int_rate": 5.5, "loan_term": 18,
+        "te_pct": 0,
+    }
+
 # ══════════════════════════════════════════════════
 #  헬스체크
 # ══════════════════════════════════════════════════
@@ -432,6 +650,42 @@ def parse_pf_model(filepath: str) -> dict:
         except Exception:
             pass
 
+    # ── CF_Annual → 연도별 실제 수익 추출
+    try:
+        with wb.get_sheet("CF_Annual") as ws:
+            for row in ws.rows():
+                vals = [c.v for c in row if c.v is not None]
+                if len(vals) < 5: continue
+                label = str(vals[0]).strip()
+                # Y1 시작 인덱스: 앞 4개(total, pre-COD, 0, 0) 제거 후 운영연도
+                op_vals = [v for v in vals[1:] if isinstance(v, (int, float))]
+
+                if "PPA #2 BESS" in label and "Revenue" in label:
+                    try:
+                        bess_rev_y1 = float(op_vals[4]) if len(op_vals) > 4 else 0
+                        bess_mw = assumptions.get("bess_mw") or 199
+                        if bess_rev_y1 > 0 and bess_mw > 0:
+                            outputs["bess_toll_y1_effective"] = round(bess_rev_y1/(bess_mw*1000*12)*1000, 4)
+                            outputs["bess_rev_y1"] = round(bess_rev_y1, 0)
+                        # 연도별 BESS 수익 (인덱스 4~38 = Y1~Y35)
+                        outputs["bess_rev_schedule"] = [round(float(v),0) for v in op_vals[4:39] if isinstance(v,(int,float))]
+                    except: pass
+
+                if "PPA #1 PV" in label and "Revenue" in label:
+                    try:
+                        pv_rev_y1 = float(op_vals[4]) if len(op_vals) > 4 else 0
+                        if pv_rev_y1 > 0:
+                            outputs["pv_rev_y1"] = round(pv_rev_y1, 0)
+                        outputs["pv_rev_schedule"] = [round(float(v),0) for v in op_vals[4:39] if isinstance(v,(int,float))]
+                    except: pass
+
+                if "Merchant PV Power Revenue" in label:
+                    try:
+                        outputs["merch_rev_schedule"] = [round(float(v),0) for v in op_vals[4:39] if isinstance(v,(int,float))]
+                    except: pass
+    except Exception:
+        pass
+
     # bess_mwh 보정: xlsb hex 파싱 한계 → pv_mwac × duration(숫자)으로 계산
     try:
         duration_str = assumptions.get("bess_duration", "")
@@ -449,6 +703,8 @@ def parse_pf_model(filepath: str) -> dict:
 async def upload_valuation(
     project_id: str = Form(...),
     scenario:   str = Form(default=""),
+    reason:     str = Form(default=""),
+    approver:   str = Form(default=""),
     file: UploadFile = File(...),
     user=Depends(get_current_user)
 ):
@@ -476,6 +732,8 @@ async def upload_valuation(
         "uploaded_by": user["email"],
         "filename":    file.filename,
         "scenario":    scenario,
+        "reason":      reason,
+        "approver":    approver,
         "assumptions": parsed["assumptions"],
         "outputs":     parsed["outputs"],
     }
@@ -518,3 +776,19 @@ def get_valuation_latest(project_id: str, user=Depends(get_current_user)):
 def get_valuation_versions(project_id: str, user=Depends(get_current_user)):
     safe_id = project_id.replace("/", "_").replace(".", "_")
     return fb_read(f"valuation/{safe_id}/versions")
+
+
+@app.post("/valuation/{project_id}/save")
+async def save_valuation_version(
+    project_id: str,
+    payload: dict,
+    user=Depends(get_current_user)
+):
+    """Calculate 결과 또는 수동 저장 → Firebase versions에 기록"""
+    safe_id = project_id.replace("/", "_").replace(".", "_")
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    payload["uploaded_by"] = user["email"]
+    payload["uploaded_at"] = datetime.datetime.now().isoformat()
+    fb_put(f"valuation/{safe_id}/versions/{ts}", payload)
+    fb_put(f"valuation/{safe_id}/latest", payload)
+    return {"ok": True, "timestamp": ts}
