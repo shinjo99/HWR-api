@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, F
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+MACRS_5YR = [0.20, 0.32, 0.192, 0.1152, 0.1152, 0.0576]
 import requests
 import jwt
 import os
