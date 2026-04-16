@@ -117,6 +117,18 @@ def fb_put(path: str, data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB 쓰기 오류: {str(e)}")
 
+def fb_patch(path: str, data: dict):
+    """Firebase PATCH — 필드 일부만 업데이트"""
+    try:
+        requests.patch(
+            f"{FB_URL}/{path}.json",
+            json=data,
+            params=fb_auth_param(),
+            timeout=5
+        )
+    except Exception:
+        pass
+
 # ══════════════════════════════════════════════════
 #  인증
 # ══════════════════════════════════════════════════
@@ -790,11 +802,47 @@ async def save_valuation_version(
     payload: dict,
     user=Depends(get_current_user)
 ):
-    """Calculate 결과 또는 수동 저장 → Firebase versions에 기록"""
+    """버전 저장 → 100개 한도, 승인 대기 status"""
     safe_id = project_id.replace("/", "_").replace(".", "_")
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     payload["uploaded_by"] = user["email"]
     payload["uploaded_at"] = datetime.datetime.now().isoformat()
+    payload["status"] = "pending"
+    payload["requested_by"] = user["email"]
+
     fb_put(f"valuation/{safe_id}/versions/{ts}", payload)
     fb_put(f"valuation/{safe_id}/latest", payload)
+
+    # 100개 한도 — 초과 시 가장 오래된 것 삭제
+    versions = fb_read(f"valuation/{safe_id}/versions") or {}
+    keys = sorted(versions.keys())
+    if len(keys) > 100:
+        for old_key in keys[:len(keys)-100]:
+            import requests as req_lib
+            fb_url = f"{FIREBASE_URL}/valuation/{safe_id}/versions/{old_key}.json?auth={FIREBASE_SECRET}"
+            req_lib.delete(fb_url)
+
     return {"ok": True, "timestamp": ts}
+
+
+@app.post("/valuation/{project_id}/versions/{ts}/approve")
+def approve_version(project_id: str, ts: str, user=Depends(get_current_user)):
+    safe_id = project_id.replace("/", "_").replace(".", "_")
+    fb_patch(f"valuation/{safe_id}/versions/{ts}", {
+        "status": "approved",
+        "approved_by": user["email"],
+        "approved_at": datetime.datetime.now().isoformat()
+    })
+    return {"ok": True}
+
+
+@app.post("/valuation/{project_id}/versions/{ts}/reject")
+def reject_version(project_id: str, ts: str, body: dict = {}, user=Depends(get_current_user)):
+    safe_id = project_id.replace("/", "_").replace(".", "_")
+    fb_patch(f"valuation/{safe_id}/versions/{ts}", {
+        "status": "rejected",
+        "rejected_by": user["email"],
+        "rejected_at": datetime.datetime.now().isoformat(),
+        "reject_reason": body.get("reason", "")
+    })
+    return {"ok": True}
