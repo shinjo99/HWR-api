@@ -917,6 +917,7 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     proj_name = payload.get("project_name", "프로젝트")
 
     context        = payload.get("context", "")
+    lang           = payload.get("lang", "en")
     thresholds     = payload.get("thresholds", {})
     current_metrics= payload.get("current_metrics", {})
 
@@ -963,17 +964,19 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "   e) FEOC equipment compliance risk\n"
         "   f) Back-loaded recovery (DS period illiquidity)\n"
         "4. Verdict: PROCEED / RECUT / PASS\n\n"
-        "Deliver in BOTH English (Goldman IC memo style) AND Korean (top Korean infra fund style).\n"
+        f"Respond in {'English' if payload.get('lang','en')=='en' else 'Korean'} only.\n"
         "Be direct. Cite specific numbers. No hedging.\n\n"
-        "Respond ONLY with valid JSON (no markdown, no code blocks):\n"
-        "Keys required: verdict, verdict_color, threshold_status, metrics, "
-        "sensitivity_en, sensitivity_kr, thesis_en, thesis_kr, "
-        "risks_en, risks_kr, rec_en, rec_kr\n"
-        "verdict: one of PROCEED / RECUT / PASS\n"
-        "verdict_color: one of green / amber / red\n"
-        "threshold_status: object with irr_ok(bool), irr_gap(str), margin_ok(bool), margin_gap(str), itc_ok(bool)\n"
-        "risks_en and risks_kr: arrays of objects with title, severity(Critical/Watch/OK), detail\n"
-        "All string values must use double quotes. No trailing commas."
+        "Respond ONLY with valid JSON (no markdown, no code blocks).\n"
+        "Required keys:\n"
+        "verdict: PROCEED / RECUT / PASS\n"
+        "verdict_color: green / amber / red\n"
+        "threshold_status: {irr_ok:bool, irr_gap:str, margin_ok:bool, margin_gap:str, itc_ok:bool}\n"
+        "metrics: one-line key metrics string\n"
+        "sensitivity: dev margin upside/downside analysis with c/Wp numbers\n"
+        "thesis: 3-4 sentence investment thesis\n"
+        "risks: array of {title:str, severity:Critical|Watch|OK, detail:str}\n"
+        "rec: 2-3 sentence actionable recommendation\n"
+        "All strings double-quoted. No trailing commas. No extra text outside JSON."
     )
 
     resp = requests.post(
@@ -985,7 +988,7 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         },
         json={
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 2500,
+            "max_tokens": 4000,
             "messages": [{"role": "user", "content": prompt}]
         },
         timeout=45
