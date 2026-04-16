@@ -827,6 +827,86 @@ def get_valuation_versions(project_id: str, user=Depends(get_current_user)):
     return fb_read(f"valuation/{safe_id}/versions")
 
 
+@app.post("/valuation/generate-ic-summary")
+async def generate_ic_summary(payload: dict, user=Depends(get_current_user)):
+    """Claude API로 IC Summary 전문 보고서 생성"""
+    if not ANTHROPIC_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY 환경변수 미설정")
+
+    proj    = payload.get("project_name", "Project")
+    metrics = payload.get("metrics", {})
+    scenarios = payload.get("scenarios", [])
+    assumptions = payload.get("assumptions", {})
+    history = payload.get("history", [])
+    today   = payload.get("date", "")
+
+    scen_text = ""
+    if scenarios:
+        scen_text = "\n\nScenario Analysis:\n"
+        for s in scenarios:
+            scen_text += f"  {s.get('name','')}: IRR {s.get('irr','—')}, Dev Margin {s.get('margin','—')}\n"
+
+    hist_text = ""
+    if history:
+        hist_text = "\n\nVersion History (recent):\n"
+        for h in history[:3]:
+            hist_text += f"  {h.get('date','')} — {h.get('reason','')}\n"
+
+    prompt = (
+        "You are a senior investment analyst at a US renewable energy developer. "
+        "Write a concise, professional Investment Committee (IC) Summary in Korean (with key financial metrics in English). "
+        "Use formal Korean business writing style. Structure it with clear sections.\n\n"
+        f"Project: {proj}\n"
+        f"Date: {today}\n\n"
+        "Financial Metrics:\n"
+        f"  Sponsor IRR: {metrics.get('sirr','—')}\n"
+        f"  Dev Margin: {metrics.get('dev_margin','—')}\n"
+        f"  Levered IRR: {metrics.get('lirr','—')}\n"
+        f"  Unlevered IRR: {metrics.get('uirr','—')}\n"
+        f"  EBITDA Yield: {metrics.get('ebitda_yield','—')}\n"
+        f"  Total CAPEX: {metrics.get('capex','—')}\n"
+        f"  Debt: {metrics.get('debt','—')} ({metrics.get('debt_pct','—')})\n"
+        f"  Tax Equity: {metrics.get('te','—')}\n"
+        f"  Sponsor Equity: {metrics.get('eq','—')}\n"
+        f"  PPA: {metrics.get('ppa','—')}\n"
+        f"  BESS Toll: {metrics.get('toll','—')}\n"
+        f"  ITC/PTC: {metrics.get('credit','—')}\n"
+        f"  Flip Yield: {metrics.get('flip','—')}\n"
+        f"{scen_text}{hist_text}\n\n"
+        "Write the IC Summary with these sections:\n"
+        "1. 프로젝트 개요 (2-3 sentences)\n"
+        "2. 핵심 재무 지표 (bullet points with brief commentary)\n"
+        "3. Deal Structure 특징 (TE flip structure, debt terms 등)\n"
+        "4. 리스크 요인 (2-3 key risks)\n"
+        "5. 투자 의견 (1 paragraph recommendation)\n\n"
+        "Keep it concise — suitable for a 1-page print. "
+        "Return ONLY valid JSON: "
+        '{{"sections":[{{"title":"섹션제목","content":"내용"}}]}}'
+    )
+
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 2000,
+            "messages": [{"role": "user", "content": prompt}]
+        },
+        timeout=40
+    )
+    if resp.status_code != 200:
+        raise HTTPException(500, f"Claude API 오류: {resp.text[:200]}")
+
+    data = resp.json()
+    text = "".join(b.get("text","") for b in data.get("content",[]))
+    clean = text.replace("```json","").replace("```","").strip()
+    return {"ok": True, "result": clean}
+
+
 @app.post("/valuation/analyze-cf")
 async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     """CF 데이터를 Claude API로 분석하여 인사이트 반환"""
@@ -836,17 +916,74 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     cf_text   = payload.get("cf_text", "")
     proj_name = payload.get("project_name", "프로젝트")
 
+    context        = payload.get("context", "")
+    thresholds     = payload.get("thresholds", {})
+    current_metrics= payload.get("current_metrics", {})
+
+    irr_thr    = thresholds.get("sponsor_irr_pct", 9.0)
+    margin_thr = thresholds.get("dev_margin_cwp", 10.0)
+    itc_thr    = thresholds.get("itc_min_pct", 30.0)
+
+    curr_irr    = current_metrics.get("sponsor_irr_pct", "?")
+    curr_margin = current_metrics.get("dev_margin_cwp", "?")
+    curr_itc    = current_metrics.get("itc_rate_pct", "?")
+    ppa_term    = current_metrics.get("ppa_term", "?")
+    toll_term   = current_metrics.get("toll_term", "?")
+    pv_mwac     = current_metrics.get("pv_mwac", "?")
+
     prompt = (
-        f"미국 태양광+BESS 프로젝트 파이낸스 전문가로서 아래 연도별 Sponsor Cash Flow를 분석해줘.\n\n"
-        f"프로젝트: {proj_name}\n\n"
-        f"{cf_text}\n\n"
-        "다음 관점으로 3~4개의 핵심 인사이트를 한국어로 작성해줘:\n"
-        "1. 연도별 CF 패턴의 주요 특징 (MACRS 세금혜택, DS 기간, BESS 증설 등)\n"
-        "2. CF 급등/급락 시점과 원인\n"
-        "3. 회수 구조 평가 (Back-loaded 정도, 리스크)\n"
-        "4. 투자자 관점 핵심 체크포인트\n\n"
-        "응답 형식 (JSON만, 다른 텍스트 없이):\n"
-        '{"insights":[{"icon":"이모지","title":"제목(20자 이내)","body":"설명(100자 이내)"}]}'
+        "You are a senior investment professional at a top-tier infrastructure fund "
+        "(Goldman Sachs Infrastructure / Macquarie / Brookfield quality). "
+        "This developer's business model is 100% develop-and-sell. "
+        "Evaluate this US solar+BESS project against the firm's investment thresholds "
+        "and deliver a final IC-grade investment decision memo.\n\n"
+        f"PROJECT: {proj_name} | Size: {pv_mwac} MWac\n"
+        f"FINANCIAL SUMMARY: {context}\n"
+        f"ANNUAL SPONSOR CF (Y1-Y10): {cf_text}\n\n"
+        "=== FIRM INVESTMENT THRESHOLDS ===\n"
+        f"  Minimum Dev Margin : {margin_thr} c/Wp\n"
+        f"  Minimum Sponsor IRR: {irr_thr}%\n"
+        f"  Minimum ITC Rate   : {itc_thr}%\n\n"
+        "=== CURRENT PROJECT METRICS ===\n"
+        f"  Dev Margin : {curr_margin} c/Wp\n"
+        f"  Sponsor IRR: {curr_irr}%\n"
+        f"  ITC Rate   : {curr_itc}%\n"
+        f"  PPA Term   : {ppa_term} yrs | Toll Term: {toll_term} yrs\n\n"
+        "REQUIRED ANALYSIS:\n"
+        "1. Check each threshold — is it met? By how much?\n"
+        "2. Dev Margin Sensitivity:\n"
+        "   - If IRR >= threshold: How high can dev margin go (c/Wp) before IRR drops below threshold? "
+        "     Estimate using: higher dev margin = higher sale price = more equity = lower buyer IRR\n"
+        "   - If IRR < threshold: How much must dev margin be cut (c/Wp) to reach IRR threshold?\n"
+        "3. Risk Assessment — score each (Critical/Watch/OK):\n"
+        "   a) ITC/PTC rate — 40% adder eligible? Prevailing wage compliance?\n"
+        "   b) BESS Toll structure — term, counterparty, renewal optionality\n"
+        "   c) PPA counterparty credit quality and term remaining\n"
+        "   d) Merchant period exposure post-PPA/Toll expiry\n"
+        "   e) FEOC equipment compliance risk\n"
+        "   f) Back-loaded recovery (DS period illiquidity)\n"
+        "4. Verdict: PROCEED / RECUT / PASS\n\n"
+        "Deliver in BOTH English (Goldman IC memo style) AND Korean (top Korean infra fund style).\n"
+        "Be direct. Cite specific numbers. No hedging.\n\n"
+        "Respond ONLY with this JSON:\n"
+        "{"
+        "\"verdict\": \"PROCEED|RECUT|PASS\","
+        "\"verdict_color\": \"green|amber|red\","
+        "\"threshold_status\": {"
+        "  \"irr_ok\": true/false, \"irr_gap\": \"e.g. +0.92% above threshold\","
+        "  \"margin_ok\": true/false, \"margin_gap\": \"e.g. +10c/Wp above threshold\","
+        "  \"itc_ok\": true/false"
+        "},"
+        "\"metrics\": \"one-liner with key numbers\","
+        "\"sensitivity_en\": \"Dev Margin upside/downside analysis with specific c/Wp numbers\","
+        "\"sensitivity_kr\": \"Korean version\","
+        "\"thesis_en\": \"3-4 sentences. Investment thesis for IC committee.\","
+        "\"thesis_kr\": \"Korean version\","
+        "\"risks_en\": [{{\"title\":\"\",\"severity\":\"Critical|Watch|OK\",\"detail\":\"one sentence\"}}],"
+        "\"risks_kr\": [{{\"title\":\"\",\"severity\":\"Critical|Watch|양호\",\"detail\":\"한 문장\"}}],"
+        "\"rec_en\": \"2-3 sentences. What to do NOW.\","
+        "\"rec_kr\": \"행동 권고\""
+        "}"
     )
 
     resp = requests.post(
