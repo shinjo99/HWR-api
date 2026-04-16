@@ -918,6 +918,7 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
 
     context        = payload.get("context", "")
     lang           = payload.get("lang", "en")
+    mode           = payload.get("mode", "full")  # full=IC Opinion, interp=CF 해석
     thresholds     = payload.get("thresholds", {})
     current_metrics= payload.get("current_metrics", {})
 
@@ -932,7 +933,16 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     toll_term   = current_metrics.get("toll_term", "?")
     pv_mwac     = current_metrics.get("pv_mwac", "?")
 
-    prompt = (
+    if mode == "interp":
+        prompt = (
+            "미국 태양광+BESS PF 전문가로서 아래 연도별 Sponsor CF 패턴을 분석해줘.\n"
+            f"프로젝트: {proj_name}\n"
+            f"CF: {cf_text}\n\n"
+            "3~4개 핵심 인사이트를 JSON으로 반환 (다른 텍스트 없이):\n"
+            '{"insights":[{"title":"제목","detail":"설명(80자이내)"}]}'
+        )
+    else:
+        prompt = (
         "You are a senior investment professional at a top-tier infrastructure fund "
         "(Goldman Sachs Infrastructure / Macquarie / Brookfield quality). "
         "This developer's business model is 100% develop-and-sell. "
@@ -951,19 +961,20 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         f"  ITC Rate   : {curr_itc}%\n"
         f"  PPA Term   : {ppa_term} yrs | Toll Term: {toll_term} yrs\n\n"
         "REQUIRED ANALYSIS:\n"
-        "1. Check each threshold — is it met? By how much?\n"
-        "2. Dev Margin Sensitivity:\n"
-        "   - If IRR >= threshold: How high can dev margin go (c/Wp) before IRR drops below threshold? "
-        "     Estimate using: higher dev margin = higher sale price = more equity = lower buyer IRR\n"
-        "   - If IRR < threshold: How much must dev margin be cut (c/Wp) to reach IRR threshold?\n"
-        "3. Risk Assessment — score each (Critical/Watch/OK):\n"
-        "   a) ITC/PTC rate — 40% adder eligible? Prevailing wage compliance?\n"
-        "   b) BESS Toll structure — term, counterparty, renewal optionality\n"
-        "   c) PPA counterparty credit quality and term remaining\n"
-        "   d) Merchant period exposure post-PPA/Toll expiry\n"
-        "   e) FEOC equipment compliance risk\n"
-        "   f) Back-loaded recovery (DS period illiquidity)\n"
-        "4. Verdict: PROCEED / RECUT / PASS\n\n"
+        "1. THRESHOLD CHECK — state pass/fail and exact gap for each\n"
+        "2. VERDICT LOGIC (follow strictly):\n"
+        "   - If ALL thresholds pass: verdict = PROCEED (default). "
+        "     Only downgrade to RECUT if there is a Critical risk that fundamentally changes the return profile.\n"
+        "   - If ANY threshold fails: verdict = RECUT, state exactly what needs to change\n"
+        "   - PASS only if IRR is below threshold AND margin cannot recover it\n"
+        "   Thresholds passing with good headroom is a STRONG positive signal. Do not bury it.\n"
+        "3. DEV MARGIN SENSITIVITY (required):\n"
+        "   - Upside: max dev margin (c/Wp) maintainable before IRR drops to threshold\n"
+        "   - Downside: min dev margin (c/Wp) at IRR = threshold (if applicable)\n"
+        "   - Express as: 'Current 20c/Wp has Xc/Wp upside to Yc/Wp before IRR hits threshold'\n"
+        "4. RISK ASSESSMENT — only 3-4 most material risks. Score Critical/Watch/OK:\n"
+        "   Focus on: ITC adder eligibility, BESS toll renewal, merchant tail, FEOC\n"
+        "   Do NOT list risks that are standard/expected for this asset class as Critical\n"
         f"Respond in {'English' if payload.get('lang','en')=='en' else 'Korean'} only.\n"
         "Be direct. Cite specific numbers. No hedging.\n\n"
         "Respond ONLY with valid JSON (no markdown, no code blocks).\n"
