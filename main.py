@@ -122,6 +122,10 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+class ValuationCalcRequest(BaseModel):
+    project_id: str = ""
+    inputs: dict = {}
+
 @app.post("/auth/login")
 def login(req: LoginRequest):
     users = get_users()
