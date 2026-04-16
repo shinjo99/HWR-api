@@ -50,7 +50,8 @@ app.add_middleware(
 )
 
 # ── 설정 ──────────────────────────────────────────
-JWT_SECRET  = os.environ.get("JWT_SECRET", "hwr-secret-change-this")
+JWT_SECRET     = os.environ.get("JWT_SECRET", "hwr-secret-change-this")
+ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 FB_URL      = os.environ.get("FB_URL", "https://team-dashboard-c0d7b-default-rtdb.asia-southeast1.firebasedatabase.app")
 FB_SECRET   = os.environ.get("FB_SECRET", "")  # Firebase Database Secret
 
@@ -824,6 +825,51 @@ def get_valuation_latest(project_id: str, user=Depends(get_current_user)):
 def get_valuation_versions(project_id: str, user=Depends(get_current_user)):
     safe_id = project_id.replace("/", "_").replace(".", "_")
     return fb_read(f"valuation/{safe_id}/versions")
+
+
+@app.post("/valuation/analyze-cf")
+async def analyze_cf(payload: dict, user=Depends(get_current_user)):
+    """CF 데이터를 Claude API로 분석하여 인사이트 반환"""
+    if not ANTHROPIC_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY 환경변수 미설정")
+
+    cf_text   = payload.get("cf_text", "")
+    proj_name = payload.get("project_name", "프로젝트")
+
+    prompt = (
+        f"미국 태양광+BESS 프로젝트 파이낸스 전문가로서 아래 연도별 Sponsor Cash Flow를 분석해줘.\n\n"
+        f"프로젝트: {proj_name}\n\n"
+        f"{cf_text}\n\n"
+        "다음 관점으로 3~4개의 핵심 인사이트를 한국어로 작성해줘:\n"
+        "1. 연도별 CF 패턴의 주요 특징 (MACRS 세금혜택, DS 기간, BESS 증설 등)\n"
+        "2. CF 급등/급락 시점과 원인\n"
+        "3. 회수 구조 평가 (Back-loaded 정도, 리스크)\n"
+        "4. 투자자 관점 핵심 체크포인트\n\n"
+        "응답 형식 (JSON만, 다른 텍스트 없이):\n"
+        '{"insights":[{"icon":"이모지","title":"제목(20자 이내)","body":"설명(100자 이내)"}]}'
+    )
+
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": prompt}]
+        },
+        timeout=30
+    )
+    if resp.status_code != 200:
+        raise HTTPException(500, f"Claude API 오류: {resp.text[:200]}")
+
+    data = resp.json()
+    text = "".join(b.get("text","") for b in data.get("content",[]))
+    clean = text.replace("```json","").replace("```","").strip()
+    return {"ok": True, "result": clean}
 
 
 @app.post("/valuation/{project_id}/save")
