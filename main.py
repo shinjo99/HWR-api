@@ -326,8 +326,6 @@ def parse_pf_model(filepath: str) -> dict:
                         "PJ Characteristic":        ("technology",   str),
                         "State":                    ("state",        str),
                         "PV : Project Size (MWac)": ("pv_mwac",      float),
-                        "ESS size (MW)":            ("bess_mw",      str),
-                        "ESS storage size (MWh)":   ("bess_mwh",     str),
                         "NTP Date":                 ("ntp",          str),
                         "COD":                      ("cod",          str),
                         "DC/AC Ratio":              ("dc_ac_ratio",  float),
@@ -339,6 +337,28 @@ def parse_pf_model(filepath: str) -> dict:
                             assumptions[key] = typ(val) if val is not None else None
                         except Exception:
                             assumptions[key] = str(val) if val is not None else None
+
+                    # BESS: ESS size 행은 "4hr" 같은 duration값 → bess_duration으로 저장
+                    if label == "ESS size (MW)":
+                        assumptions["bess_duration"] = str(val) if val is not None else None
+
+                    # BESS: ESS Duration 행에서 실제 MW 추출
+                    if label == "ESS Duration (Hours)":
+                        try:
+                            assumptions["bess_mw"] = float(val)
+                        except Exception:
+                            pass
+
+                    # BESS: ESS storage MWh — hex/int 모두 처리
+                    if label == "ESS storage size (MWh)":
+                        try:
+                            v = val
+                            if isinstance(v, str) and v.startswith("0x"):
+                                assumptions["bess_mwh"] = float(int(v, 16))
+                            else:
+                                assumptions["bess_mwh"] = float(v)
+                        except Exception:
+                            assumptions["bess_mwh"] = None
         except Exception:
             pass
 
@@ -371,7 +391,7 @@ def parse_pf_model(filepath: str) -> dict:
         except Exception:
             pass
 
-        # ── Summary → outputs (Case 2 컬럼 기준) ──
+        # ── Summary → outputs (Case 2 = PV+BESS 컬럼 기준, index 3) ──
         try:
             with wb.get_sheet("Summary") as ws:
                 for row in ws.rows():
@@ -398,7 +418,8 @@ def parse_pf_model(filepath: str) -> dict:
                     }
                     if label in summary_map:
                         key = summary_map[label]
-                        val = vals[2] if len(vals) > 2 else None
+                        # Case 2 (PV+BESS) = vals[3], fallback to vals[2]
+                        val = vals[3] if len(vals) > 3 else (vals[2] if len(vals) > 2 else None)
                         try:
                             v = float(val)
                             if key in ("levered_irr", "unlevered_irr",
