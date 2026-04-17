@@ -2127,19 +2127,35 @@ p {{ margin: 4pt 0; color: #1F2937; }}
 @app.post("/valuation/export-pdf")
 async def export_ic_pdf(payload: dict, user=Depends(get_current_user)):
     """IC Summary PDF 생성 (WeasyPrint, world-class formatting)."""
+    import traceback
+    import sys
+
+    # Step 1: WeasyPrint import
     try:
         from weasyprint import HTML
-    except ImportError:
-        raise HTTPException(
-            500,
-            "WeasyPrint가 설치되지 않았습니다. requirements.txt에 weasyprint 추가 후 재배포하세요."
-        )
+        print(f"[export-pdf] WeasyPrint import OK", flush=True)
+    except Exception as e:
+        print(f"[export-pdf] WeasyPrint import FAILED: {e}", flush=True)
+        traceback.print_exc(file=sys.stdout)
+        raise HTTPException(500, f"WeasyPrint import 실패: {str(e)[:300]}")
 
-    html_str = _build_ic_pdf_html(payload)
+    # Step 2: HTML 문자열 생성
+    try:
+        html_str = _build_ic_pdf_html(payload)
+        print(f"[export-pdf] HTML built, length={len(html_str)}", flush=True)
+    except Exception as e:
+        print(f"[export-pdf] HTML build FAILED: {e}", flush=True)
+        traceback.print_exc(file=sys.stdout)
+        raise HTTPException(500, f"HTML 생성 오류: {str(e)[:300]}")
+
+    # Step 3: PDF 렌더링
     try:
         pdf_bytes = HTML(string=html_str).write_pdf()
+        print(f"[export-pdf] PDF rendered, size={len(pdf_bytes)} bytes", flush=True)
     except Exception as e:
-        raise HTTPException(500, f"PDF 생성 오류: {str(e)[:200]}")
+        print(f"[export-pdf] PDF render FAILED: {e}", flush=True)
+        traceback.print_exc(file=sys.stdout)
+        raise HTTPException(500, f"PDF 렌더링 오류: {str(e)[:300]}")
 
     proj_name = payload.get("project_name", "IC_Summary").replace(" ", "_")
     date_str = payload.get("date", datetime.date.today().isoformat()).replace("-", "")
@@ -2150,6 +2166,25 @@ async def export_ic_pdf(payload: dict, user=Depends(get_current_user)):
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+
+# ── WeasyPrint 진단용 미니멀 테스트 엔드포인트 ───────
+@app.get("/valuation/export-pdf-test")
+async def export_pdf_test(user=Depends(get_current_user)):
+    """WeasyPrint가 살아있는지 간단히 테스트."""
+    import traceback, sys
+    try:
+        from weasyprint import HTML
+        simple_html = "<html><body><h1>Test</h1><p>안녕하세요, WeasyPrint 테스트</p></body></html>"
+        pdf = HTML(string=simple_html).write_pdf()
+        return _Response(
+            content=pdf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": 'attachment; filename="weasyprint_test.pdf"'}
+        )
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+        raise HTTPException(500, f"테스트 실패: {str(e)[:500]}")
 
 
 @app.post("/valuation/analyze-cf")
