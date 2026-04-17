@@ -54,6 +54,7 @@ JWT_SECRET     = os.environ.get("JWT_SECRET", "hwr-secret-change-this")
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 FB_URL      = os.environ.get("FB_URL", "https://team-dashboard-c0d7b-default-rtdb.asia-southeast1.firebasedatabase.app")
 FB_SECRET   = os.environ.get("FB_SECRET", "")  # Firebase Database Secret
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")  # https://fred.stlouisfed.org/docs/api/api_key.html
 
 # ── 사용자 계정 (환경변수로 관리) ─────────────────
 # 형식: "email:password:role,email:password:role"
@@ -315,6 +316,399 @@ def get_dashboard(user=Depends(get_current_user)):
         "divest": fb_read("divest"),
         "atlas": fb_read("atlas"),
     }
+
+# ══════════════════════════════════════════════════
+#  외부 시장 벤치마크 (FRED + LevelTen)
+# ══════════════════════════════════════════════════
+
+# FRED 시리즈 매핑: HEUH 투자 의사결정에 의미있는 지표만
+FRED_SERIES = {
+    # 금리 (할인율 기준점)
+    "us_10y":       {"id": "DGS10",        "label": "US 10Y Treasury",    "unit": "%",       "group": "rates"},
+    "us_2y":        {"id": "DGS2",         "label": "US 2Y Treasury",     "unit": "%",       "group": "rates"},
+    "fed_funds":    {"id": "DFF",          "label": "Fed Funds Rate",     "unit": "%",       "group": "rates"},
+    "bbb_spread":   {"id": "BAMLC0A4CBBB", "label": "BBB Corp Spread",    "unit": "%",       "group": "rates"},
+    # 에너지/인플레
+    "henry_hub":    {"id": "DHHNGSP",      "label": "Henry Hub NatGas",   "unit": "$/MMBtu", "group": "energy"},
+    "cpi":          {"id": "CPIAUCSL",     "label": "US CPI (Index)",     "unit": "Index",   "group": "macro"},
+    # 환율
+    "krw_usd":      {"id": "DEXKOUS",      "label": "KRW/USD",            "unit": "KRW",     "group": "fx"},
+}
+
+# TAN ETF는 FRED에 없음 — Stooq로 별도 조회
+STOOQ_SYMBOLS = {
+    "tan":          {"symbol": "tan.us",   "label": "TAN (Solar ETF)",    "unit": "$",       "group": "equity"},
+    "icln":         {"symbol": "icln.us",  "label": "ICLN (Clean Energy)", "unit": "$",      "group": "equity"},
+}
+
+def _fred_fetch(series_id: str, days: int = 180):
+    """FRED API에서 시리즈 데이터 조회. 최근 N일치."""
+    if not FRED_API_KEY:
+        return None
+    try:
+        end = datetime.date.today()
+        start = end - datetime.timedelta(days=days)
+        res = requests.get(
+            "https://api.stlouisfed.org/fred/series/observations",
+            params={
+                "series_id": series_id,
+                "api_key": FRED_API_KEY,
+                "file_type": "json",
+                "observation_start": start.isoformat(),
+                "observation_end": end.isoformat(),
+                "sort_order": "asc",
+            },
+            timeout=10,
+        )
+        if res.status_code != 200:
+            return None
+        obs = res.json().get("observations", [])
+        # "." = 결측, 제외
+        points = [
+            {"date": o["date"], "value": float(o["value"])}
+            for o in obs if o.get("value") not in (".", "", None)
+        ]
+        return points
+    except Exception:
+        return None
+
+def _stooq_fetch(symbol: str, days: int = 180):
+    """Stooq에서 일별 종가 조회 (CSV, 키 불필요)."""
+    try:
+        url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200 or "Date,Open" not in res.text:
+            return None
+        lines = res.text.strip().split("\n")[1:]
+        end = datetime.date.today()
+        start = end - datetime.timedelta(days=days)
+        points = []
+        for ln in lines:
+            parts = ln.split(",")
+            if len(parts) < 5:
+                continue
+            try:
+                d = datetime.date.fromisoformat(parts[0])
+                if d < start:
+                    continue
+                points.append({"date": parts[0], "value": float(parts[4])})
+            except Exception:
+                continue
+        return points
+    except Exception:
+        return None
+
+def _summarize_series(points):
+    """시계열 → 최신값/변동/스파크라인 요약."""
+    if not points:
+        return None
+    latest = points[-1]
+    prev = points[-2] if len(points) >= 2 else latest
+    # 약 일주일 전 (영업일 5개 전)
+    week_ago = points[-6] if len(points) >= 6 else points[0]
+    # 약 한달 전 (영업일 21개 전)
+    month_ago = points[-22] if len(points) >= 22 else points[0]
+    return {
+        "latest": latest["value"],
+        "latest_date": latest["date"],
+        "d_1d": latest["value"] - prev["value"],
+        "d_1w": latest["value"] - week_ago["value"],
+        "d_1m": latest["value"] - month_ago["value"],
+        "spark": [p["value"] for p in points[-30:]],  # 최근 30포인트
+        "n_points": len(points),
+    }
+
+@app.get("/benchmark/market")
+def get_market_benchmark(force: int = 0, user=Depends(get_current_user)):
+    """FRED + Stooq 시장 벤치마크. 6시간 캐시."""
+    today = datetime.date.today().isoformat()
+    cache_key = f"benchmark_cache/market/{today}"
+
+    # 캐시 확인 (force=1이면 무시)
+    if not force:
+        cached = fb_read(cache_key)
+        if cached and cached.get("fetched_at"):
+            try:
+                fetched = datetime.datetime.fromisoformat(cached["fetched_at"])
+                age_hrs = (datetime.datetime.utcnow() - fetched).total_seconds() / 3600
+                if age_hrs < 6:
+                    return cached
+            except Exception:
+                pass
+
+    if not FRED_API_KEY:
+        raise HTTPException(500, "FRED_API_KEY 환경변수 미설정")
+
+    result = {
+        "fetched_at": datetime.datetime.utcnow().isoformat()[:19],
+        "source": "FRED + Stooq",
+        "series": {},
+    }
+
+    # FRED 시리즈
+    for key, meta in FRED_SERIES.items():
+        pts = _fred_fetch(meta["id"], days=400 if key == "cpi" else 180)
+        summary = _summarize_series(pts) if pts else None
+        result["series"][key] = {
+            **meta,
+            "data": summary,
+            "ok": summary is not None,
+        }
+
+    # Stooq 시리즈
+    for key, meta in STOOQ_SYMBOLS.items():
+        pts = _stooq_fetch(meta["symbol"], days=180)
+        summary = _summarize_series(pts) if pts else None
+        result["series"][key] = {
+            **meta,
+            "data": summary,
+            "ok": summary is not None,
+        }
+
+    # CPI는 YoY % 변화율로 계산 (Index 자체는 의미가 없음)
+    cpi = result["series"].get("cpi", {}).get("data")
+    if cpi and cpi.get("spark") and len(cpi["spark"]) >= 13:
+        try:
+            yoy = (cpi["spark"][-1] / cpi["spark"][-13] - 1) * 100
+            result["series"]["cpi"]["yoy_pct"] = round(yoy, 2)
+        except Exception:
+            pass
+
+    # 캐시 저장
+    try:
+        fb_put(cache_key, result)
+    except Exception:
+        pass  # 캐시 실패해도 응답은 반환
+    return result
+
+
+# ── LevelTen PPA Index 업로드/조회 ─────────────────
+@app.post("/benchmark/levelten/upload")
+async def upload_levelten(
+    file: UploadFile = File(...),
+    quarter: str = Form(...),  # e.g. "2026-Q1"
+    user=Depends(get_current_user),
+):
+    """LevelTen PPA Index 리포트 업로드 → Claude API로 파싱 → Firebase 저장."""
+    if not ANTHROPIC_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY 환경변수 미설정")
+
+    raw = await file.read()
+    filename = file.filename or "levelten.pdf"
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    # 1) 파일 타입별 텍스트 추출
+    source_text = ""
+    parse_mode = ""
+    parsed = None
+
+    if ext in ("csv", "tsv"):
+        try:
+            source_text = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            source_text = raw.decode("latin-1", errors="ignore")
+        parse_mode = "csv"
+
+    elif ext in ("xlsx", "xls", "xlsb"):
+        parse_mode = "excel"
+        tmp_path = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+            tmp_path = tmp.name
+            tmp.write(raw)
+            tmp.close()
+
+            if ext == "xlsb":
+                lines = []
+                with open_workbook(tmp_path) as wb:
+                    for sheet_name in wb.sheets[:5]:
+                        lines.append(f"\n=== Sheet: {sheet_name} ===")
+                        with wb.get_sheet(sheet_name) as sh:
+                            for row in sh.rows():
+                                vals = [str(c.v) if c.v is not None else "" for c in row]
+                                lines.append("\t".join(vals))
+                source_text = "\n".join(lines)[:40000]
+            else:
+                try:
+                    from openpyxl import load_workbook
+                except ImportError:
+                    raise HTTPException(400, "openpyxl이 설치되지 않았습니다. requirements.txt에 추가하세요.")
+                wb = load_workbook(tmp_path, data_only=True, read_only=True)
+                lines = []
+                for sheet_name in wb.sheetnames[:5]:
+                    lines.append(f"\n=== Sheet: {sheet_name} ===")
+                    for row in wb[sheet_name].iter_rows(values_only=True):
+                        vals = [str(v) if v is not None else "" for v in row]
+                        lines.append("\t".join(vals))
+                wb.close()
+                source_text = "\n".join(lines)[:40000]
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"Excel 파싱 실패: {str(e)}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try: os.unlink(tmp_path)
+                except Exception: pass
+
+    elif ext == "pdf":
+        parse_mode = "pdf"
+        import base64
+        pdf_b64 = base64.standard_b64encode(raw).decode("utf-8")
+
+        headers = {
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        prompt = (
+            "You are parsing a LevelTen Energy PPA Price Index report. "
+            "Extract ALL regional PPA pricing data into strict JSON (no markdown, no prose).\n\n"
+            "Required schema:\n"
+            "{\n"
+            '  "quarter": "YYYY-QN",\n'
+            '  "report_date": "YYYY-MM-DD or null",\n'
+            '  "entries": [\n'
+            '    {"tech":"solar|wind|storage", "region":"ERCOT|PJM|MISO|CAISO|SPP|NYISO|ISO-NE|WECC|SERC|...",\n'
+            '     "term_yr":10, "p25": <number $/MWh>, "p50": <number or null>, "p75": <number or null>}\n'
+            "  ],\n"
+            '  "notes": "brief description of trends mentioned in the report (1-2 sentences)"\n'
+            "}\n\n"
+            "Rules:\n"
+            "- p25/p50/p75 are USD per MWh.\n"
+            "- If only one price tier is shown, put it in p25.\n"
+            "- Extract every region × tech × term combination found.\n"
+            "- Return ONLY the JSON object. No explanation. No code fences."
+        )
+        body = {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 4000,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": pdf_b64,
+                    }},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        }
+        try:
+            res = requests.post("https://api.anthropic.com/v1/messages",
+                                headers=headers, json=body, timeout=90)
+            if res.status_code != 200:
+                raise HTTPException(502, f"Claude API 오류: {res.text[:300]}")
+            ai_text = res.json()["content"][0]["text"].strip()
+            if ai_text.startswith("```"):
+                ai_text = ai_text.split("```", 2)[1]
+                if ai_text.startswith("json"): ai_text = ai_text[4:]
+                ai_text = ai_text.rsplit("```", 1)[0]
+            parsed = json.loads(ai_text.strip())
+        except HTTPException:
+            raise
+        except json.JSONDecodeError as e:
+            raise HTTPException(500, f"AI 응답 JSON 파싱 실패: {str(e)}")
+    else:
+        raise HTTPException(400, f"지원하지 않는 파일 형식: .{ext} (PDF, CSV, XLSX, XLSB 지원)")
+
+    # CSV/Excel인 경우 Claude에게 텍스트 파싱 요청
+    if parse_mode in ("csv", "excel"):
+        headers = {
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        prompt = (
+            "You are parsing LevelTen Energy PPA Price Index tabular data. "
+            f"The data below is from a {parse_mode.upper()} export.\n\n"
+            f"DATA:\n{source_text[:30000]}\n\n"
+            "Extract into strict JSON (no markdown, no prose):\n"
+            "{\n"
+            '  "quarter": "YYYY-QN",\n'
+            '  "report_date": "YYYY-MM-DD or null",\n'
+            '  "entries": [\n'
+            '    {"tech":"solar|wind|storage", "region":"ERCOT|PJM|MISO|...",\n'
+            '     "term_yr":10, "p25":<number $/MWh>, "p50":<number or null>, "p75":<number or null>}\n'
+            "  ],\n"
+            '  "notes": "brief trend summary"\n'
+            "}\n"
+            "Return ONLY the JSON object. No code fences."
+        )
+        body = {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 4000,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            res = requests.post("https://api.anthropic.com/v1/messages",
+                                headers=headers, json=body, timeout=90)
+            if res.status_code != 200:
+                raise HTTPException(502, f"Claude API 오류: {res.text[:300]}")
+            ai_text = res.json()["content"][0]["text"].strip()
+            if ai_text.startswith("```"):
+                ai_text = ai_text.split("```", 2)[1]
+                if ai_text.startswith("json"): ai_text = ai_text[4:]
+                ai_text = ai_text.rsplit("```", 1)[0]
+            parsed = json.loads(ai_text.strip())
+        except HTTPException:
+            raise
+        except json.JSONDecodeError as e:
+            raise HTTPException(500, f"AI 응답 JSON 파싱 실패: {str(e)}")
+
+    if not parsed:
+        raise HTTPException(500, "파싱 결과가 비어있습니다.")
+
+    # 쿼터 형식 검증 (YYYY-QN)
+    import re
+    if not re.match(r'^\d{4}-Q[1-4]$', quarter.upper()):
+        raise HTTPException(400, "쿼터 형식은 YYYY-Q1 ~ YYYY-Q4 여야 합니다.")
+    quarter = quarter.upper()
+
+    # 쿼터 덮어쓰기 (사용자가 명시한 값이 우선)
+    parsed["quarter"] = quarter
+    parsed["uploaded_at"] = datetime.datetime.utcnow().isoformat()[:19]
+    parsed["uploaded_by"] = user["email"]
+    parsed["filename"] = filename
+    parsed["parse_mode"] = parse_mode
+
+    # Firebase 저장: benchmark/levelten/{quarter}
+    fb_put(f"benchmark/levelten/{quarter}", parsed)
+
+    return {"ok": True, "quarter": quarter, "entries_count": len(parsed.get("entries", [])), "data": parsed}
+
+
+@app.get("/benchmark/levelten")
+def get_levelten_all(user=Depends(get_current_user)):
+    """모든 분기별 LevelTen 데이터."""
+    return fb_read("benchmark/levelten") or {}
+
+
+@app.get("/benchmark/levelten/latest")
+def get_levelten_latest(user=Depends(get_current_user)):
+    """가장 최신 분기의 LevelTen 데이터."""
+    all_data = fb_read("benchmark/levelten") or {}
+    if not all_data:
+        return {}
+    # 쿼터 문자열 정렬 (YYYY-QN 포맷이라 사전순 정렬로 충분)
+    latest_key = sorted(all_data.keys())[-1]
+    return {"quarter": latest_key, **all_data[latest_key]}
+
+
+@app.delete("/benchmark/levelten/{quarter}")
+def delete_levelten(quarter: str, user=Depends(require_admin)):
+    """특정 분기 LevelTen 데이터 삭제."""
+    import re
+    if not re.match(r'^\d{4}-Q[1-4]$', quarter.upper()):
+        raise HTTPException(400, "쿼터 형식은 YYYY-Q1 ~ YYYY-Q4 여야 합니다.")
+    quarter = quarter.upper()
+    try:
+        requests.delete(f"{FB_URL}/benchmark/levelten/{quarter}.json",
+                        params=fb_auth_param(), timeout=5)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, f"삭제 오류: {str(e)}")
 
 
 # ══════════════════════════════════════════════════
@@ -1068,9 +1462,14 @@ async def save_valuation_version(
     keys = sorted(versions.keys())
     if len(keys) > 100:
         for old_key in keys[:len(keys)-100]:
-            import requests as req_lib
-            fb_url = f"{FIREBASE_URL}/valuation/{safe_id}/versions/{old_key}.json?auth={FIREBASE_SECRET}"
-            req_lib.delete(fb_url)
+            try:
+                requests.delete(
+                    f"{FB_URL}/valuation/{safe_id}/versions/{old_key}.json",
+                    params=fb_auth_param(),
+                    timeout=5
+                )
+            except Exception:
+                pass
 
     return {"ok": True, "timestamp": ts}
 
