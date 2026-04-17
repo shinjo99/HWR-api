@@ -827,6 +827,7 @@ def _calc_engine(inputs: dict) -> dict:
     # bess_toll: CF_Annual Y1 실제값 우선, 없으면 Summary 파싱값
     bess_toll   = inputs.get('bess_toll_y1_effective') or inputs.get('bess_toll', 14.50)
     bess_toll_t = int(inputs.get('bess_toll_term', 20))
+    bess_toll_esc = inputs.get('bess_toll_esc', 0) / 100  # Toll escalation (%)
     merch_ppa   = inputs.get('merchant_ppa', 45.0)
     merch_esc   = inputs.get('merchant_esc', 3.0) / 100
     degradation = inputs.get('degradation', 0.0064)
@@ -871,7 +872,7 @@ def _calc_engine(inputs: dict) -> dict:
         if bess_sched and yr-1 < len(bess_sched):
             bess_rev = bess_sched[yr-1]
         else:
-            bess_rev = bess_mw*1000*bess_toll*12/1000 if yr<=bess_toll_t else 0
+            bess_rev = bess_mw*1000*bess_toll*((1+bess_toll_esc)**(yr-1))*12/1000 if yr<=bess_toll_t else 0
 
         if merch_sched and yr-1 < len(merch_sched) and merch_sched[yr-1] > 0:
             pv_rev = merch_sched[yr-1]  # merchant 기간은 merch_sched 우선
@@ -2376,8 +2377,7 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "   - BESS is NOT subject to the 2026 solar cliff. Do NOT flag BESS ITC as imminent risk.\n"
         "3. HEUH Business Model & BOC Status:\n"
         "   - HEUH develops → sells at NTP (pre-COD). Post-COD execution risk does NOT affect IC decision.\n"
-        "   - HEUH has established BOC for project pool via Physical Work Test completed before Sep 2, 2025\n"
-        "     (pre-Notice 2025-42 guidance), plus MPT pool for Safe Harbor management.\n"
+        "   - HEUH has established BOC for its project pool via Physical Work Test, managed by its compliance team.\n"
         "   - Individual project matching to BOC pool is operational matter — do NOT flag as financial risk.\n"
         "   - Post-BOC physical construction schedule is flexible within 4-year Continuity Safe Harbor.\n"
         "4. FEOC (Foreign Entity of Concern): compliance checklist item — do NOT use as verdict driver.\n\n"
@@ -2502,10 +2502,9 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
                 "title": "ITC BOC(Beginning of Construction) 매칭 확인",
                 "severity": "Watch",
                 "detail": (
-                    "HEUH는 Physical Work Test + MPT pool 방식으로 BOC 요건을 "
-                    "2025년 9월 이전에 이미 확보한 상태. 본 프로젝트가 기확보된 "
-                    "BOC pool과 매칭되는지 NTP 전 확인 권고. 매칭 확보 시 "
-                    "Continuity Safe Harbor에 따라 2030년 말까지 PIS 여유."
+                    "HEUH는 Physical Work Test 방식으로 BOC 요건을 확보하여 관리 중. "
+                    "본 프로젝트가 기확보된 BOC pool과 매칭되는지 NTP 전 확인 권고. "
+                    "매칭 확보 시 Continuity Safe Harbor에 따라 2030년 말까지 PIS 여유."
                 )
             },
             {
@@ -2524,10 +2523,10 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
                 "title": "ITC BOC Matching Verification",
                 "severity": "Watch",
                 "detail": (
-                    "HEUH has established BOC (Beginning of Construction) for its project pool via "
-                    "Physical Work Test completed before Sep 2, 2025, supplemented by MPT pool for "
-                    "Safe Harbor. Verify this project is matched to the secured BOC pool before NTP. "
-                    "Once matched, Continuity Safe Harbor extends PIS to Dec 31, 2030."
+                    "HEUH has established BOC (Beginning of Construction) for its project pool "
+                    "via Physical Work Test, managed by its compliance team. Verify this project "
+                    "is matched to the secured BOC pool before NTP. Once matched, Continuity Safe "
+                    "Harbor extends PIS to Dec 31, 2030."
                 )
             },
             {
