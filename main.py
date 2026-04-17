@@ -2198,20 +2198,50 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
             '{"insights":[{"title":"제목","detail":"설명(80자이내)"}]}'
         )
     else:
+        # 동적 날짜 계산
+        _today = datetime.date.today()
+        _current_year = _today.year
+        _current_quarter = f"{_current_year}-Q{(_today.month - 1) // 3 + 1}"
+        _prev_q_month = _today.month - 3
+        _prev_q_year = _current_year
+        if _prev_q_month <= 0:
+            _prev_q_month += 12
+            _prev_q_year -= 1
+        _prev_quarter = f"{_prev_q_year}-Q{(_prev_q_month - 1) // 3 + 1}"
+
+        # 시장 데이터 컨텍스트 (payload에서 주입, 없으면 기본)
+        market_context = payload.get("market_context", {}) or {}
+        rates_txt = market_context.get("rates_summary", "")  # "10Y: 4.29%, Fed: 4.50%, BBB: 1.01%"
+        levelten_txt = market_context.get("levelten_summary", "")  # "ERCOT Solar P25: $52/MWh (2026-Q1)"
+        peer_irr_txt = market_context.get("peer_irr_summary", "")  # "Solar+BESS Levered Pre-Tax: 10-13%"
+
+        market_block = ""
+        if rates_txt or levelten_txt or peer_irr_txt:
+            market_block = "=== CURRENT MARKET DATA (most recent, use this INSTEAD of your training knowledge) ===\n"
+            if rates_txt:
+                market_block += f"  Interest Rates: {rates_txt}\n"
+            if levelten_txt:
+                market_block += f"  LevelTen PPA Index: {levelten_txt}\n"
+            if peer_irr_txt:
+                market_block += f"  Peer IRR Benchmarks: {peer_irr_txt}\n"
+            market_block += "\n"
+
         prompt = (
         "You are the head of Investment Committee at Hanwha Energy USA (HEUH), "
         "a renewable energy developer whose sole business model is: develop → sell at NTP. "
         "The IC decision: should we continue spending development capital on this project? "
-        "Key context: the US ITC expires July 4 2026 for new starts (safe harbor via MPT purchase extends eligibility). "
+        f"TODAY'S DATE: {_today.isoformat()} (current quarter: {_current_quarter}, prior: {_prev_quarter}). "
+        "Key context: the US ITC Section 48E expires July 4, 2026 for new construction starts "
+        "(safe harbor via MPT 5% module purchase extends eligibility beyond that date). "
         "Your judgment must cover BOTH (A) development risk and (B) exit attractiveness.\n\n"
         f"PROJECT: {proj_name} | Size: {pv_mwac} MWac\n"
         f"FINANCIAL SUMMARY: {context}\n"
         f"PROJECT METADATA: {proj_ctx}\n"
         f"ANNUAL SPONSOR CF (Y1-Y10): {cf_text}\n\n"
+        + market_block +
         "=== FIRM INVESTMENT THRESHOLDS ===\n"
         f"  Minimum Dev Margin : {margin_thr} c/Wp\n"
-        f"  Minimum Sponsor IRR: {irr_thr}%\n"
-        f"  Minimum ITC Rate   : {itc_thr}%\n\n"
+        f"  Minimum Sponsor IRR: {irr_thr}% (Levered Pre-Tax)\n\n"
         "=== CURRENT PROJECT METRICS ===\n"
         f"  Dev Margin : {curr_margin} c/Wp\n"
         f"  Sponsor IRR: {curr_irr}%\n"
@@ -2223,17 +2253,18 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "   Check each threshold — pass/fail with exact gap.\n"
         "   Dev Margin Sensitivity: 'Current Xc/Wp → upside to Yc/Wp / downside floor Zc/Wp'\n"
         "\n"
-        "B. DEVELOPMENT RISK (use your 2025 market knowledge)\n"
+        "B. DEVELOPMENT RISK (PRIORITIZE supplied MARKET DATA above; supplement with your own knowledge only for context)\n"
         "   1. ITC / Safe Harbor risk:\n"
-        "      - Given NTP year and COD year, is COD achievable before ITC sunset (July 4 2026 for new starts)?\n"
-        "      - If COD year > 2026, has safe harbor (MPT: 5% module deposit) been completed? "
-        "        Assume yes if ntp_year <= 2026, flag as Watch if 2027+\n"
+        "      - Given NTP and COD dates, is COD achievable before ITC sunset (July 4, 2026 for new starts)?\n"
+        "      - If COD > July 2026, verify safe harbor (MPT 5% module deposit) is in place\n"
         "   2. EPC price adequacy: given $/Wdc implied by CAPEX and project size, "
-        "      compare to 2025 US utility-scale solar+BESS market range ($0.9-1.2/Wdc PV, $350-450/kWh BESS). "
-        "      Flag if outlier.\n"
-        "   3. ISO / grid risk: based on ISO and state, note interconnection queue depth "
-        "      and any known congestion or curtailment risk (use 2025 market knowledge).\n"
-        "   4. PPA market: is the contracted PPA price competitive vs 2025 P25 market for this ISO?\n"
+        "      compare to RECENT utility-scale solar+BESS market range. "
+        "      Use SUPPLIED MARKET DATA if available; otherwise cite current quarter benchmark. "
+        "      Flag if outlier vs this quarter's data.\n"
+        "   3. ISO / grid risk: based on ISO and state, assess interconnection queue status "
+        "      and any known congestion or curtailment risk (use most recent data).\n"
+        "   4. PPA market: compare contracted PPA to SUPPLIED LevelTen P25 data if given, "
+        "      otherwise reference current quarter's P25 benchmark for this ISO.\n"
         "\n"
         "C. VERDICT LOGIC (strict):\n"
         "   PROCEED: all financial thresholds pass AND no Critical development risk\n"
