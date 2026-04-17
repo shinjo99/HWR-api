@@ -1546,10 +1546,34 @@ def _build_ic_pdf_html(data: dict) -> str:
     thr_irr = thresholds.get("sponsor_irr_pct", 9.0)
     thr_margin = thresholds.get("dev_margin_cwp", 10.0)
 
-    # 위험 항목 렌더
+    # 리스크 분리: compliance_count만큼 앞쪽은 고정 체크리스트, 뒤는 AI 생성
+    compliance_count = int(ic_analysis.get("compliance_count", 0) or 0)
+    compliance_items = risks[:compliance_count] if compliance_count else []
+    ai_risks = risks[compliance_count:] if compliance_count else risks
+
+    # 1) 컴플라이언스 체크리스트 HTML
+    compliance_html = ""
+    for r in compliance_items:
+        title = _esc_html(r.get("title", ""))
+        detail = _esc_html(r.get("detail", ""))
+        sev = r.get("severity", "Watch")
+        compliance_html += f"""
+        <div class="compliance-item">
+          <div class="compliance-box"></div>
+          <div class="compliance-body">
+            <div class="compliance-head">
+              <span class="compliance-title">{title}</span>
+              <span class="compliance-sev">{sev}</span>
+            </div>
+            <div class="compliance-detail">{detail}</div>
+          </div>
+        </div>
+        """
+
+    # 2) AI 프로젝트별 리스크 HTML
     risks_html = ""
     sev_color = {"Critical": "#DC2626", "Watch": "#D97706", "OK": "#059669"}
-    for i, r in enumerate(risks[:8]):
+    for i, r in enumerate(ai_risks[:8]):
         sev = r.get("severity", "OK")
         c = sev_color.get(sev, "#6B7280")
         title = _esc_html(r.get("title", ""))
@@ -1900,6 +1924,59 @@ p {{ margin: 4pt 0; color: #1F2937; }}
   margin-left: 26pt;
 }}
 
+/* Compliance Checklist items */
+.compliance-note {{
+  font-size: 8pt;
+  color: #6B7280;
+  font-style: italic;
+  margin-bottom: 8pt;
+}}
+.compliance-item {{
+  display: flex;
+  gap: 10pt;
+  padding: 9pt 12pt;
+  background: #FFFBEB;
+  border: 0.5pt solid #FCD34D;
+  border-left: 3pt solid #D97706;
+  border-radius: 2pt;
+  margin-bottom: 6pt;
+}}
+.compliance-box {{
+  flex-shrink: 0;
+  width: 12pt;
+  height: 12pt;
+  border: 1pt solid #9CA3AF;
+  border-radius: 2pt;
+  margin-top: 2pt;
+}}
+.compliance-body {{ flex: 1; }}
+.compliance-head {{
+  display: flex;
+  align-items: center;
+  gap: 8pt;
+  margin-bottom: 3pt;
+}}
+.compliance-title {{
+  font-size: 10pt;
+  font-weight: 700;
+  color: #111827;
+  flex: 1;
+}}
+.compliance-sev {{
+  font-size: 7pt;
+  font-weight: 700;
+  color: #D97706;
+  border: 0.5pt solid #D97706;
+  padding: 1pt 6pt;
+  border-radius: 8pt;
+  letter-spacing: 0.05em;
+}}
+.compliance-detail {{
+  font-size: 9pt;
+  color: #78350F;
+  line-height: 1.6;
+}}
+
 /* Scenario table */
 .scen-table {{
   width: 100%;
@@ -2109,13 +2186,20 @@ p {{ margin: 4pt 0; color: #1F2937; }}
 <!-- ══ PAGE 4 — RISK ASSESSMENT ══ -->
 <div class="page-break">
   <h1>Risk Assessment</h1>
-  <div class="section-sub">개발 리스크 · 재무 리스크 · 외부 리스크</div>
+  <div class="section-sub">규정 준수 체크 · 프로젝트별 리스크 (의사결정에 반영되지 않음)</div>
 
-  {risks_html if risks_html else '<p style="color:#9CA3AF">AI 분석 미완료 — IC Opinion 탭에서 Run AI Analysis 실행 후 재생성</p>'}
+  <h2 style="margin-top:10pt">📋 규정 준수 체크리스트 (IC 승인 전 확인 필수)</h2>
+  <div class="compliance-note">고정 체크리스트 · 모든 프로젝트 공통 적용</div>
+  {compliance_html if compliance_html else '<p style="color:#9CA3AF;font-size:9pt">체크리스트 없음</p>'}
+
+  <h2 style="margin-top:18pt">🔍 프로젝트별 리스크 (AI 모니터링)</h2>
+  <div class="compliance-note">정보 제공 · 경제성 판정에 영향 없음</div>
+  {risks_html if risks_html else '<p style="color:#9CA3AF;font-size:9pt">AI 분석 미완료 — IC Opinion 탭에서 Run AI Analysis 실행 후 재생성</p>'}
 
   <div class="confidential-note">
     본 문서는 Hanwha Energy USA Holdings 내부 투자심의 목적으로만 작성되었으며, 외부 유출을 금합니다.<br>
-    수치 및 가정은 {_esc_html(today)} 기준 엑셀 재무모델 및 시장 데이터를 근거로 하며, 시장 변동에 따라 달라질 수 있습니다.
+    수치 및 가정은 {_esc_html(today)} 기준 엑셀 재무모델 및 시장 데이터를 근거로 하며, 시장 변동에 따라 달라질 수 있습니다.<br>
+    경제성 판정(PROCEED/RECUT/STOP)은 Dev Margin · Sponsor IRR · Unlev IRR vs WACC 기준의 순수 경제 분석 결과입니다.
   </div>
 </div>
 
@@ -2244,15 +2328,15 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
             _prev_q_year -= 1
         _prev_quarter = f"{_prev_q_year}-Q{(_prev_q_month - 1) // 3 + 1}"
 
-        # 시장 데이터 컨텍스트 (payload에서 주입, 없으면 기본)
+        # 시장 데이터 컨텍스트 (payload에서 주입)
         market_context = payload.get("market_context", {}) or {}
-        rates_txt = market_context.get("rates_summary", "")  # "10Y: 4.29%, Fed: 4.50%, BBB: 1.01%"
-        levelten_txt = market_context.get("levelten_summary", "")  # "ERCOT Solar P25: $52/MWh (2026-Q1)"
-        peer_irr_txt = market_context.get("peer_irr_summary", "")  # "Solar+BESS Levered Pre-Tax: 10-13%"
+        rates_txt = market_context.get("rates_summary", "")
+        levelten_txt = market_context.get("levelten_summary", "")
+        peer_irr_txt = market_context.get("peer_irr_summary", "")
 
         market_block = ""
         if rates_txt or levelten_txt or peer_irr_txt:
-            market_block = "=== CURRENT MARKET DATA (most recent, use this INSTEAD of your training knowledge) ===\n"
+            market_block = "=== CURRENT MARKET DATA (most recent; use this INSTEAD of training knowledge) ===\n"
             if rates_txt:
                 market_block += f"  Interest Rates: {rates_txt}\n"
             if levelten_txt:
@@ -2261,82 +2345,115 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
                 market_block += f"  Peer IRR Benchmarks: {peer_irr_txt}\n"
             market_block += "\n"
 
+        # 경제성 지표 추출 (Unlevered vs WACC 비교용)
+        unlev_irr = current_metrics.get("unlevered_irr_pct")
+        wacc_val  = current_metrics.get("wacc_pct")
+        wacc_block = ""
+        if unlev_irr is not None and wacc_val is not None:
+            wacc_block = (
+                f"  Unlevered Pre-Tax IRR : {unlev_irr}% (project-level)\n"
+                f"  WACC                  : {wacc_val}% (hurdle)\n"
+                f"  Value Creation        : Unlev - WACC = "
+                f"{'POSITIVE' if float(unlev_irr)>float(wacc_val) else 'NEGATIVE'}\n"
+            )
+
         prompt = (
         "You are the head of Investment Committee at Hanwha Energy USA (HEUH), "
-        "a renewable energy developer whose sole business model is: develop → sell at NTP. "
-        "The IC decision: should we continue spending development capital on this project? "
-        f"TODAY'S DATE: {_today.isoformat()} (current quarter: {_current_quarter}, prior: {_prev_quarter}). "
-        "Key context: the US ITC Section 48E expires July 4, 2026 for new construction starts "
-        "(safe harbor via MPT 5% module purchase extends eligibility beyond that date). "
-        "Your judgment must cover BOTH (A) development risk and (B) exit attractiveness.\n\n"
+        "a renewable energy developer whose sole business model is: develop → sell at NTP (before COD). "
+        "The IC decision: should we continue spending development capital on this project?\n\n"
+
+        f"TODAY'S DATE: {_today.isoformat()} (current quarter: {_current_quarter}, prior: {_prev_quarter}).\n\n"
+
+        "═══ KNOWN REGULATORY & OPERATIONAL FACTS (treat as GIVEN; do not second-guess) ═══\n"
+        "1. ITC Section 48E — Solar PV:\n"
+        "   - 'Begin Construction' deadline: July 4, 2026 for full credit eligibility\n"
+        "   - Projects started before July 4, 2026: 4-year continuity safe harbor (PIS by Dec 31, 2030)\n"
+        "   - Projects started after July 4, 2026: must be Placed-in-Service by Dec 31, 2027\n"
+        "2. ITC Section 48E — BESS (SEPARATE TRACK from PV):\n"
+        "   - Begin Construction by Dec 31, 2033 → 100% ITC\n"
+        "   - 2034 → 75%, 2035 → 50%, 2036 → expires\n"
+        "   - BESS is NOT subject to the 2026 solar cliff. Do NOT flag BESS ITC as imminent risk.\n"
+        "3. HEUH Business Model:\n"
+        "   - HEUH develops → sells at NTP (pre-COD). Post-COD execution risk does NOT affect IC decision.\n"
+        "   - HEUH manages Safe Harbor via MPT pool strategy (pre-purchased modules, matched to projects as-needed).\n"
+        "   - Safe Harbor MATCHING to this specific project is operational matter — do NOT flag as financial risk.\n"
+        "4. FEOC (Foreign Entity of Concern): compliance checklist item — do NOT use as verdict driver.\n\n"
+
         f"PROJECT: {proj_name} | Size: {pv_mwac} MWac\n"
         f"FINANCIAL SUMMARY: {context}\n"
         f"PROJECT METADATA: {proj_ctx}\n"
         f"ANNUAL SPONSOR CF (Y1-Y10): {cf_text}\n\n"
+
         + market_block +
-        "=== FIRM INVESTMENT THRESHOLDS ===\n"
+
+        "=== INVESTMENT THRESHOLDS (firm hurdles) ===\n"
         f"  Minimum Dev Margin : {margin_thr} c/Wp\n"
         f"  Minimum Sponsor IRR: {irr_thr}% (Levered Pre-Tax)\n\n"
+
         "=== CURRENT PROJECT METRICS ===\n"
         f"  Dev Margin : {curr_margin} c/Wp\n"
-        f"  Sponsor IRR: {curr_irr}%\n"
+        f"  Sponsor IRR: {curr_irr}% (Levered Pre-Tax)\n"
+        + wacc_block +
         f"  ITC Rate   : {curr_itc}%\n"
         f"  PPA Term   : {ppa_term} yrs | Toll Term: {toll_term} yrs\n\n"
-        "REQUIRED ANALYSIS (all in one unified IC memo):\n"
-        "\n"
-        "A. FINANCIAL THRESHOLDS\n"
-        "   Check each threshold — pass/fail with exact gap.\n"
-        "   Dev Margin Sensitivity: 'Current Xc/Wp → upside to Yc/Wp / downside floor Zc/Wp'\n"
-        "\n"
-        "B. DEVELOPMENT RISK (PRIORITIZE supplied MARKET DATA above; supplement with your own knowledge only for context)\n"
-        "   1. ITC / Safe Harbor risk:\n"
-        "      - Given NTP and COD dates, is COD achievable before ITC sunset (July 4, 2026 for new starts)?\n"
-        "      - If COD > July 2026, verify safe harbor (MPT 5% module deposit) is in place\n"
-        "   2. EPC price adequacy: given $/Wdc implied by CAPEX and project size, "
-        "      compare to RECENT utility-scale solar+BESS market range. "
-        "      Use SUPPLIED MARKET DATA if available; otherwise cite current quarter benchmark. "
-        "      Flag if outlier vs this quarter's data.\n"
-        "   3. ISO / grid risk: based on ISO and state, assess interconnection queue status "
-        "      and any known congestion or curtailment risk (use most recent data).\n"
-        "   4. PPA market: compare contracted PPA to SUPPLIED LevelTen P25 data if given, "
-        "      otherwise reference current quarter's P25 benchmark for this ISO.\n"
-        "\n"
-        "C. VERDICT LOGIC (strict):\n"
-        "   PROCEED: all financial thresholds pass AND no Critical development risk\n"
-        "   RECUT: threshold miss OR one Critical development risk fixable by sponsor\n"
-        "   PASS: IRR unrecoverable OR Critical development risk not fixable\n"
-        "   Headroom above threshold is a STRONG positive — say so explicitly.\n"
-        "\n"
-        "═══ LANGUAGE (CRITICAL) ═══\n"
-        + ("ALL text fields MUST be written in KOREAN (한국어). This includes:\n"
-           "- threshold_status.irr_gap / margin_gap (e.g., '기준 대비 +1.5%p 여유')\n"
-           "- dev_ic.ntp_prob / itc_expiry_verdict / safe_harbor / stage_ok (full Korean sentences)\n"
-           "- sensitivity_kr (Korean required; sensitivity_en can stay English)\n"
-           "- thesis: Korean investment thesis, formal business tone (존대체)\n"
-           "- risks[].title, risks[].detail: Korean titles and descriptions\n"
-           "- rec: Korean recommendation, 2-3 sentences, actionable\n"
-           "Only 'verdict' (PROCEED/RECUT/PASS) and 'verdict_color' (green/amber/red) stay English.\n"
-           "Financial numbers with units can stay in English form (e.g., '10.38%', '$68.82/MWh').\n"
-           "DO NOT mix English and Korean in the same field except for numbers/units.\n"
+
+        "═══ VERDICT FRAMEWORK (PURE ECONOMICS ONLY) ═══\n"
+        "The verdict is determined ONLY by economic criteria. Development risks are monitoring items and do NOT affect verdict.\n\n"
+        "Economic criteria:\n"
+        "  1. Dev Margin vs threshold (primary: HEUH's exit value)\n"
+        "  2. Sponsor IRR (Levered Pre-Tax) vs threshold (market-clearing for buyer)\n"
+        "  3. Unlevered IRR vs WACC (true value creation — leverage-independent)\n\n"
+        "VERDICT RULES:\n"
+        "  PROCEED:\n"
+        "    - Dev Margin ≥ threshold AND Sponsor IRR ≥ threshold AND Unlev IRR > WACC\n"
+        "    - Express threshold headroom explicitly if positive (e.g., '+1.5%p 여유')\n"
+        "  RECUT:\n"
+        "    - 1~2 criteria near miss (gap < 1.5%p from threshold) AND recoverable via negotiation\n"
+        "    - Typical levers: PPA price revision, CAPEX reduction, TE/debt terms\n"
+        "  STOP:\n"
+        "    - Multiple criteria missed OR Unlev IRR < WACC (value destruction)\n"
+        "    - Unrecoverable: gap too wide to close via normal levers\n\n"
+
+        "═══ RISK ANALYSIS (monitoring only — NOT verdict driver) ═══\n"
+        "Identify project-specific risks AI can assess:\n"
+        "  - EPC price adequacy: $/Wdc vs current market (use supplied MARKET DATA if provided)\n"
+        "  - ISO / interconnection queue risk based on ISO and state\n"
+        "  - PPA market competitiveness vs supplied LevelTen P25 data (if given)\n"
+        "  - Construction timeline vs ITC cliff (Solar PV only — be specific about July 4, 2026 vs Dec 31, 2027 PIS)\n"
+        "  - BESS replacement CAPEX / augmentation assumption sanity\n"
+        "DO NOT generate risks for:\n"
+        "  - Safe Harbor matching (handled separately as fixed checklist item)\n"
+        "  - FEOC compliance (handled separately as fixed checklist item)\n"
+        "  - BESS ITC expiry (not imminent — 2033+ horizon)\n"
+        "  - Generic 'market uncertainty' or 'policy risk' without specifics\n\n"
+
+        "═══ LANGUAGE ═══\n"
+        + ("ALL text fields in KOREAN (한국어), formal business tone (존대체).\n"
+           "Only 'verdict' (PROCEED/RECUT/STOP) and 'verdict_color' (green/amber/red) stay English.\n"
+           "Financial numbers with units can stay English-style (e.g., '10.38%', '$68.82/MWh').\n"
+           "DO NOT mix languages within a single field.\n"
            if payload.get("lang","en")=="kr" else
-           "ALL text fields in ENGLISH only. Formal institutional investor tone.\n"
-           "threshold_status.irr_gap / margin_gap / dev_ic fields / thesis / risks / rec all in English.\n")
+           "ALL text fields in ENGLISH only. Formal institutional investor tone.\n")
         + "\n"
         "Be direct. Cite specific numbers. No hedging.\n\n"
+
         "Respond ONLY with valid JSON (no markdown, no code blocks).\n"
         "Required keys:\n"
-        "verdict: PROCEED / RECUT / PASS\n"
-        "verdict_color: green / amber / red\n"
-        "threshold_status: {irr_ok:bool, irr_gap:str, margin_ok:bool, margin_gap:str, itc_ok:bool}\n"
-        "dev_ic: {ntp_prob:str, itc_expiry_verdict:str, safe_harbor:str, stage_ok:str}\n"
-        "metrics: ONE compact line, under 120 chars, pipe-delimited. "
-        "Example: '199 MWac | 10.4% IRR | $39.8M Margin | $68.8 PPA | $836M CAPEX | 30% ITC'. "
-        "Use short units (no 'dev margin', no 'c/Wp' in parentheses). Keep each token tight.\n"
-        "sensitivity_en: dev margin upside/downside in English with c/Wp numbers\n"
-        "sensitivity_kr: same in Korean\n"
-        "thesis: 3-4 sentence investment thesis\n"
-        "risks: array of {title:str, severity:Critical|Watch|OK, detail:str}\n"
-        "rec: 2-3 sentence actionable recommendation\n"
+        "  verdict: \"PROCEED\" | \"RECUT\" | \"STOP\"\n"
+        "  verdict_color: \"green\" | \"amber\" | \"red\"\n"
+        "  threshold_status: {\n"
+        "    margin_ok: bool, margin_gap: str,\n"
+        "    irr_ok: bool, irr_gap: str,\n"
+        "    wacc_spread_ok: bool, wacc_spread: str  (e.g., '+0.88%p' or '-1.20%p')\n"
+        "  }\n"
+        "  metrics: ONE compact line, under 120 chars, pipe-delimited.\n"
+        "    Example: '199 MWac | 10.4% IRR | $39.8M Margin | $68.8 PPA | $836M CAPEX | 30% ITC'\n"
+        "  sensitivity_en: dev margin upside/downside in English with c/Wp numbers\n"
+        "  sensitivity_kr: same in Korean\n"
+        "  thesis: 3-4 sentence economic thesis (왜 이 결정인가)\n"
+        "  risks: array of {title, severity: Critical|Watch|OK, detail}\n"
+        "    (project-specific only; Safe Harbor/FEOC/BESS ITC are handled separately)\n"
+        "  rec: 2-3 sentence actionable recommendation (경제성 관점)\n"
         "All strings double-quoted. No trailing commas. No extra text outside JSON."
     )
 
@@ -2370,6 +2487,67 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     end   = clean.rfind("}") + 1
     if start >= 0 and end > start:
         clean = clean[start:end]
+
+    # ── 고정 규정 준수 체크리스트 2개 항목을 응답에 주입 ───────
+    # AI가 판단하는 risks와 완전히 분리된, 모든 프로젝트 공통 체크리스트
+    is_kr = payload.get("lang", "en") == "kr"
+
+    if is_kr:
+        compliance_checklist = [
+            {
+                "title": "ITC Safe Harbor 매칭 확인 필요",
+                "severity": "Watch",
+                "detail": (
+                    "HEUH는 MPT pool 방식으로 Safe Harbor를 관리하므로, 본 프로젝트가 "
+                    "기확보된 SH pool과 매칭되는지 NTP 전 확인 필수. 매칭 실패 시 ITC 자격 "
+                    "및 경제성에 영향 가능."
+                )
+            },
+            {
+                "title": "FEOC 공급망 적격성 검토 필요",
+                "severity": "Watch",
+                "detail": (
+                    "OBBBA에 따라 2026년 착공 프로젝트는 비PFE(중국/러시아/이란/북한 외) "
+                    "부품 비중 요건 적용: PV ≥40%, BESS ≥55% (매년 5%p 상향). "
+                    "EPC 계약 체결 전 배터리 셀·PV 모듈 원산지 증빙 확보 필요."
+                )
+            }
+        ]
+    else:
+        compliance_checklist = [
+            {
+                "title": "ITC Safe Harbor Matching Required",
+                "severity": "Watch",
+                "detail": (
+                    "HEUH manages Safe Harbor via MPT pool strategy. Verify before NTP that this "
+                    "project is matched to a pre-secured SH pool. Failure may affect ITC eligibility "
+                    "and economics."
+                )
+            },
+            {
+                "title": "FEOC Supply Chain Compliance Review",
+                "severity": "Watch",
+                "detail": (
+                    "Under OBBBA, 2026-start projects face non-PFE (China/Russia/Iran/DPRK excluded) "
+                    "content thresholds: PV ≥40%, BESS ≥55% (ramping +5%p annually). Verify battery "
+                    "cell and PV module country-of-origin documentation before EPC contract."
+                )
+            }
+        ]
+
+    # JSON 파싱해서 risks 배열 앞에 삽입
+    try:
+        import json as _json
+        parsed = _json.loads(clean)
+        ai_risks = parsed.get("risks", []) or []
+        # 컴플라이언스 체크리스트를 최상단, AI 리스크를 그 뒤에
+        parsed["risks"] = compliance_checklist + ai_risks
+        # 구분 위해 플래그 추가 (프론트엔드에서 활용 가능)
+        parsed["compliance_count"] = len(compliance_checklist)
+        clean = _json.dumps(parsed, ensure_ascii=False)
+    except Exception as _e:
+        # 파싱 실패 시 원본 그대로 반환 (프론트가 처리)
+        print(f"[analyze-cf] JSON merge failed: {_e}", flush=True)
 
     return {"ok": True, "result": clean}
 
