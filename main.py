@@ -2199,7 +2199,7 @@ p {{ margin: 4pt 0; color: #1F2937; }}
   <div class="confidential-note">
     본 문서는 Hanwha Energy USA Holdings 내부 투자심의 목적으로만 작성되었으며, 외부 유출을 금합니다.<br>
     수치 및 가정은 {_esc_html(today)} 기준 엑셀 재무모델 및 시장 데이터를 근거로 하며, 시장 변동에 따라 달라질 수 있습니다.<br>
-    경제성 판정(PROCEED/RECUT/STOP)은 Dev Margin · Sponsor IRR · Unlev IRR vs WACC 기준의 순수 경제 분석 결과입니다.
+    경제성 판정(PROCEED/RECUT/STOP)은 Dev Margin · Sponsor IRR · Unlev IRR vs WACC 기준의 순수 경제 분석 결과이며, 규정 준수 체크리스트와 개별 리스크는 별도 관리 대상입니다.
   </div>
 </div>
 
@@ -2366,17 +2366,20 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
 
         "═══ KNOWN REGULATORY & OPERATIONAL FACTS (treat as GIVEN; do not second-guess) ═══\n"
         "1. ITC Section 48E — Solar PV:\n"
-        "   - 'Begin Construction' deadline: July 4, 2026 for full credit eligibility\n"
-        "   - Projects started before July 4, 2026: 4-year continuity safe harbor (PIS by Dec 31, 2030)\n"
-        "   - Projects started after July 4, 2026: must be Placed-in-Service by Dec 31, 2027\n"
+        "   - 'Beginning of Construction' (BOC) is a LEGAL construct, not physical construction start.\n"
+        "   - BOC deadline: July 4, 2026 — established via Physical Work Test (on-site or off-site binding work).\n"
+        "   - Continuity Safe Harbor preserved: if BOC is established, project has until Dec 31, 2030 (4 years) to reach PIS.\n"
+        "   - Projects missing BOC by July 4, 2026 must be Placed-in-Service by Dec 31, 2027.\n"
         "2. ITC Section 48E — BESS (SEPARATE TRACK from PV):\n"
         "   - Begin Construction by Dec 31, 2033 → 100% ITC\n"
         "   - 2034 → 75%, 2035 → 50%, 2036 → expires\n"
         "   - BESS is NOT subject to the 2026 solar cliff. Do NOT flag BESS ITC as imminent risk.\n"
-        "3. HEUH Business Model:\n"
+        "3. HEUH Business Model & BOC Status:\n"
         "   - HEUH develops → sells at NTP (pre-COD). Post-COD execution risk does NOT affect IC decision.\n"
-        "   - HEUH manages Safe Harbor via MPT pool strategy (pre-purchased modules, matched to projects as-needed).\n"
-        "   - Safe Harbor MATCHING to this specific project is operational matter — do NOT flag as financial risk.\n"
+        "   - HEUH has established BOC for project pool via Physical Work Test completed before Sep 2, 2025\n"
+        "     (pre-Notice 2025-42 guidance), plus MPT pool for Safe Harbor management.\n"
+        "   - Individual project matching to BOC pool is operational matter — do NOT flag as financial risk.\n"
+        "   - Post-BOC physical construction schedule is flexible within 4-year Continuity Safe Harbor.\n"
         "4. FEOC (Foreign Entity of Concern): compliance checklist item — do NOT use as verdict driver.\n\n"
 
         f"PROJECT: {proj_name} | Size: {pv_mwac} MWac\n"
@@ -2419,12 +2422,13 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "  - EPC price adequacy: $/Wdc vs current market (use supplied MARKET DATA if provided)\n"
         "  - ISO / interconnection queue risk based on ISO and state\n"
         "  - PPA market competitiveness vs supplied LevelTen P25 data (if given)\n"
-        "  - Construction timeline vs ITC cliff (Solar PV only — be specific about July 4, 2026 vs Dec 31, 2027 PIS)\n"
+        "  - Construction timeline vs PIS deadlines (Solar PV: 4-year continuity → Dec 31, 2030 PIS if BOC established; BESS: flexible to 2033)\n"
         "  - BESS replacement CAPEX / augmentation assumption sanity\n"
         "DO NOT generate risks for:\n"
-        "  - Safe Harbor matching (handled separately as fixed checklist item)\n"
+        "  - Safe Harbor matching or BOC status (handled separately as fixed checklist item)\n"
         "  - FEOC compliance (handled separately as fixed checklist item)\n"
         "  - BESS ITC expiry (not imminent — 2033+ horizon)\n"
+        "  - 'Must begin physical construction by 2026' — INCORRECT; BOC is a legal construct already managed via HEUH's Physical Work Test completion\n"
         "  - Generic 'market uncertainty' or 'policy risk' without specifics\n\n"
 
         "═══ LANGUAGE ═══\n"
@@ -2495,16 +2499,17 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     if is_kr:
         compliance_checklist = [
             {
-                "title": "ITC Safe Harbor 매칭 확인 필요",
+                "title": "ITC BOC(Beginning of Construction) 매칭 확인",
                 "severity": "Watch",
                 "detail": (
-                    "HEUH는 MPT pool 방식으로 Safe Harbor를 관리하므로, 본 프로젝트가 "
-                    "기확보된 SH pool과 매칭되는지 NTP 전 확인 필수. 매칭 실패 시 ITC 자격 "
-                    "및 경제성에 영향 가능."
+                    "HEUH는 Physical Work Test + MPT pool 방식으로 BOC 요건을 "
+                    "2025년 9월 이전에 이미 확보한 상태. 본 프로젝트가 기확보된 "
+                    "BOC pool과 매칭되는지 NTP 전 확인 권고. 매칭 확보 시 "
+                    "Continuity Safe Harbor에 따라 2030년 말까지 PIS 여유."
                 )
             },
             {
-                "title": "FEOC 공급망 적격성 검토 필요",
+                "title": "FEOC 공급망 적격성 검토",
                 "severity": "Watch",
                 "detail": (
                     "OBBBA에 따라 2026년 착공 프로젝트는 비PFE(중국/러시아/이란/북한 외) "
@@ -2516,12 +2521,13 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     else:
         compliance_checklist = [
             {
-                "title": "ITC Safe Harbor Matching Required",
+                "title": "ITC BOC Matching Verification",
                 "severity": "Watch",
                 "detail": (
-                    "HEUH manages Safe Harbor via MPT pool strategy. Verify before NTP that this "
-                    "project is matched to a pre-secured SH pool. Failure may affect ITC eligibility "
-                    "and economics."
+                    "HEUH has established BOC (Beginning of Construction) for its project pool via "
+                    "Physical Work Test completed before Sep 2, 2025, supplemented by MPT pool for "
+                    "Safe Harbor. Verify this project is matched to the secured BOC pool before NTP. "
+                    "Once matched, Continuity Safe Harbor extends PIS to Dec 31, 2030."
                 )
             },
             {
