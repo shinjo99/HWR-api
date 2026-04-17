@@ -711,6 +711,44 @@ def delete_levelten(quarter: str, user=Depends(require_admin)):
         raise HTTPException(500, f"삭제 오류: {str(e)}")
 
 
+# ── 피어 IRR 벤치마크 (내부 수동 입력값) ────────────
+@app.get("/benchmark/peer-irr")
+def get_peer_irr(user=Depends(get_current_user)):
+    """저장된 피어 IRR 벤치마크 조회."""
+    return fb_read("benchmark/peer_irr") or {}
+
+
+@app.post("/benchmark/peer-irr")
+def save_peer_irr(payload: dict, user=Depends(get_current_user)):
+    """피어 IRR 벤치마크 저장 (Levered Pre-Tax IRR 레인지)."""
+    # 필드 검증
+    required_numeric = ["solar_min", "solar_max", "hybrid_min", "hybrid_max", "wind_min", "wind_max"]
+    data = {}
+    for k in required_numeric:
+        v = payload.get(k)
+        if v is None:
+            raise HTTPException(400, f"누락된 필드: {k}")
+        try:
+            fv = float(v)
+            if fv < 0 or fv > 50:
+                raise HTTPException(400, f"{k}: 0~50% 범위여야 합니다.")
+            data[k] = round(fv, 2)
+        except (ValueError, TypeError):
+            raise HTTPException(400, f"{k}: 숫자여야 합니다.")
+    # min < max 검증
+    for tech in ("solar", "hybrid", "wind"):
+        if data[f"{tech}_min"] >= data[f"{tech}_max"]:
+            raise HTTPException(400, f"{tech}: min < max 이어야 합니다.")
+    # 비고
+    note = payload.get("note", "")
+    if isinstance(note, str):
+        data["note"] = note[:200]
+    data["updated_at"] = datetime.datetime.utcnow().isoformat()[:19]
+    data["updated_by"] = user["email"]
+    fb_put("benchmark/peer_irr", data)
+    return {"ok": True, "data": data}
+
+
 # ══════════════════════════════════════════════════
 #  Valuation Calculate (Stage 1 Engine)
 # ══════════════════════════════════════════════════
@@ -1066,6 +1104,11 @@ def parse_pf_model(filepath: str) -> dict:
                         "Unlevered project IRR (full life)": "unlevered_irr",
                         "Sponsor levered IRR (full life)":   "sponsor_irr",
                         "Sponsor levered IRR (contract)":    "sponsor_irr_contract",
+                        # 신규: After-Tax IRR (Class B 관점) + WACC
+                        "Sponsor levered after-tax IRR (before NOL)":  "sponsor_irr_aftertax_before_nol",
+                        "Sponsor levered after-tax IRR (after NOL)":   "sponsor_irr_aftertax_after_nol",
+                        "Weighted average cost of capital":  "wacc",
+                        "WACC":                              "wacc",
                         "Total Project Cost":                "capex_total",
                         "Debt":                              "debt",
                         "Tax Equity Investment":             "tax_equity",
@@ -1084,12 +1127,114 @@ def parse_pf_model(filepath: str) -> dict:
                         try:
                             v = float(val)
                             if key in ("levered_irr", "unlevered_irr",
-                                       "sponsor_irr", "sponsor_irr_contract"):
+                                       "sponsor_irr", "sponsor_irr_contract",
+                                       "sponsor_irr_aftertax_before_nol",
+                                       "sponsor_irr_aftertax_after_nol",
+                                       "wacc"):
                                 outputs[key] = round(v, 6)
                             else:
                                 outputs[key] = round(v, 2)
                         except Exception:
                             pass
+        except Exception:
+            pass
+
+        # ── Returns 시트 → After-Tax IRR (Before/After NOL) 및 기타 세분화 IRR ──
+        # Returns 시트의 'Sponsor net aftertax cashflow' 줄에 IRR이 있음
+        # 각 IRR 값은 보통 4~5번째 컬럼 위치에 있고, 레이블은 맨 앞
+        try:
+            with wb.get_sheet("Returns") as ws:
+                rows_list = list(ws.rows())
+                # 라인 순서대로 처리 (NOL 이전 aftertax는 첫 번째 매칭, 이후는 두 번째)
+                aftertax_matches = []
+                unlevered_aftertax_matches = []
+                for row in rows_list:
+                    vals = [c.v for c in row]
+                    label = ""
+                    # 첫 번째 문자열 셀을 레이블로
+                    for v in vals[:3]:
+                        if isinstance(v, str) and v.strip():
+                            label = v.strip()
+                            break
+                    if not label:
+                        continue
+                    # IRR 숫자 찾기 (0 < v < 1 범위의 float)
+                    irr_val = None
+                    for v in vals:
+                        if isinstance(v, float) and 0.001 < v < 0.5 and v != 1.0:
+                            # 첫 번째 그럴듯한 IRR 값 (label 이후)
+                            irr_val = round(v, 6)
+                            break
+                    if irr_val is None:
+                        continue
+
+                    # Sponsor net pretax cashflow — Levered Pre-Tax
+                    #   "(without ITC or PTC)" = baseline (Line 25, ~10.02%)
+                    #   "(with PTC)" 는 PTC 모델이므로 제외
+                    if (label.startswith("Sponsor net pretax cashflow")
+                        and "unlevered" not in label.lower()
+                        and "with ptc" not in label.lower()
+                        and "with itc" not in label.lower()):
+                        if "sponsor_irr_levered_pretax" not in outputs:
+                            outputs["sponsor_irr_levered_pretax"] = irr_val
+                    # Sponsor net unlevered pretax cashflow
+                    elif (label.startswith("Sponsor net unlevered pretax")
+                          and "with ptc" not in label.lower()
+                          and "with itc" not in label.lower()):
+                        if "sponsor_irr_unlevered_pretax" not in outputs:
+                            outputs["sponsor_irr_unlevered_pretax"] = irr_val
+                    # Sponsor net aftertax cashflow (level IRR, NOL 전/후 두 줄)
+                    #   - 첫 등장 = Before NOL (~13.62%)
+                    #   - 두 번째 등장 (NOL effect 처리 후) = After NOL (~10.51%)
+                    # "(including Residual Value)" 및 State Tax 버전은 제외
+                    elif (label == "Sponsor net aftertax cashflow"
+                          and "residual" not in label.lower()
+                          and "state" not in label.lower()):
+                        aftertax_matches.append(irr_val)
+                    # Sponsor net unlevered aftertax cashflow
+                    elif (label == "Sponsor net unlevered aftertax cashflow"
+                          or label == "Sponsor net unlevered aftertax cashflow with NOL"):
+                        unlevered_aftertax_matches.append(irr_val)
+
+                # 매칭 순서 기반: first = before NOL, second = after NOL
+                if len(aftertax_matches) >= 1:
+                    outputs["sponsor_irr_aftertax_before_nol"] = aftertax_matches[0]
+                if len(aftertax_matches) >= 2:
+                    # 두 번째 매칭이 After NOL (세 번째 이상은 State Tax 변형)
+                    outputs["sponsor_irr_aftertax_after_nol"] = aftertax_matches[1]
+                if len(unlevered_aftertax_matches) >= 1:
+                    outputs["sponsor_irr_unlevered_aftertax_before_nol"] = unlevered_aftertax_matches[0]
+                if len(unlevered_aftertax_matches) >= 2:
+                    outputs["sponsor_irr_unlevered_aftertax_after_nol"] = unlevered_aftertax_matches[1]
+        except Exception:
+            pass
+
+        # ── Sensitivities 시트 → WACC, Cost of Debt ──
+        # "Weighted average cost of capital" 레이블이 있는 행에서 2번째 컬럼 값
+        try:
+            with wb.get_sheet("Sensitivities") as ws:
+                for row in ws.rows():
+                    vals = [c.v for c in row]
+                    label = ""
+                    for v in vals[:4]:
+                        if isinstance(v, str) and v.strip():
+                            label = v.strip()
+                            break
+                    if not label:
+                        continue
+                    low = label.lower()
+                    # WACC - "Weighted average cost of capital"
+                    if "weighted average cost of capital" in low and "wacc" not in outputs:
+                        for v in vals:
+                            if isinstance(v, float) and 0.01 < v < 0.3:
+                                outputs["wacc"] = round(v, 6)
+                                break
+                    # Cost of debt
+                    elif label.lower().strip() == "cost of debt" and "cost_of_debt" not in outputs:
+                        for v in vals:
+                            if isinstance(v, float) and 0.01 < v < 0.3:
+                                outputs["cost_of_debt"] = round(v, 6)
+                                break
         except Exception:
             pass
 
@@ -1301,6 +1446,712 @@ async def generate_ic_summary(payload: dict, user=Depends(get_current_user)):
     return {"ok": True, "result": clean}
 
 
+# ══════════════════════════════════════════════════
+#  IC Summary PDF Export (WeasyPrint — world-class formatting)
+# ══════════════════════════════════════════════════
+import base64 as _base64
+from fastapi.responses import Response as _Response
+
+def _esc_html(s):
+    """HTML escape helper."""
+    if s is None:
+        return ""
+    return (str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+def _fmt_pct(v, decimals=2):
+    """숫자 → 퍼센트 문자열. 이미 문자열이면 그대로."""
+    if v is None or v == "—":
+        return "—"
+    if isinstance(v, str):
+        return v
+    try:
+        return f"{float(v)*100:.{decimals}f}%"
+    except Exception:
+        return "—"
+
+def _fmt_usd_m(v):
+    """$M 포맷 (input in thousands)."""
+    if v is None or v == "—":
+        return "—"
+    if isinstance(v, str):
+        return v
+    try:
+        return f"${float(v)/1000:.1f}M"
+    except Exception:
+        return "—"
+
+def _build_ic_pdf_html(data: dict) -> str:
+    """IC Summary HTML (WeasyPrint용). World-class IB/PE 수준 포맷."""
+    proj_name = data.get("project_name", "Project")
+    today = data.get("date", datetime.date.today().isoformat())
+    verdict = (data.get("verdict") or "").upper() or "—"
+    verdict_color = data.get("verdict_color", "amber")
+
+    # 색상 매핑
+    color_map = {
+        "green": "#059669",  # emerald-600
+        "amber": "#D97706",  # amber-600
+        "red":   "#DC2626",  # red-600
+    }
+    v_color = color_map.get(verdict_color, "#6B7280")
+
+    # 지표
+    outputs = data.get("outputs", {}) or {}
+    assumptions = data.get("assumptions", {}) or {}
+    pv_mwac = assumptions.get("pv_mwac") or outputs.get("pv_mwac") or "—"
+    bess_mw = assumptions.get("bess_mw") or "—"
+    cod = assumptions.get("cod") or "—"
+    ntp = assumptions.get("ntp") or "—"
+    state = data.get("state") or assumptions.get("state") or "—"
+    iso = data.get("iso") or assumptions.get("iso") or "—"
+
+    # 5 IRR 지표
+    irr_lev_pre  = _fmt_pct(outputs.get("sponsor_irr_levered_pretax") or outputs.get("sponsor_irr"))
+    irr_at_before = _fmt_pct(outputs.get("sponsor_irr_aftertax_before_nol"))
+    irr_at_after  = _fmt_pct(outputs.get("sponsor_irr_aftertax_after_nol"))
+    irr_unlev    = _fmt_pct(outputs.get("sponsor_irr_unlevered_pretax") or outputs.get("unlevered_irr"))
+    wacc_val     = _fmt_pct(outputs.get("wacc"))
+
+    # 재무 요약
+    capex = _fmt_usd_m(outputs.get("capex_total"))
+    debt  = _fmt_usd_m(outputs.get("debt"))
+    te    = _fmt_usd_m(outputs.get("tax_equity"))
+    eq    = _fmt_usd_m(outputs.get("sponsor_equity"))
+    dev_margin = _fmt_usd_m(outputs.get("dev_margin"))
+    margin_cwp = outputs.get("margin_cwp")
+    margin_cwp_str = f"{margin_cwp:.2f} c/Wp" if isinstance(margin_cwp, (int, float)) else "—"
+    ppa_price = outputs.get("ppa_price") or assumptions.get("ppa_price") or "—"
+    ppa_term  = outputs.get("ppa_term") or assumptions.get("ppa_term") or "—"
+    bess_toll = outputs.get("bess_toll") or assumptions.get("bess_toll") or "—"
+    ebitda_y  = outputs.get("ebitda_yield")
+    ebitda_y_str = f"{ebitda_y:.2f}%" if isinstance(ebitda_y, (int, float)) else "—"
+
+    # AI 분석 결과 (IC Opinion 에서 생성된 것)
+    ic_analysis = data.get("ic_analysis", {}) or {}
+    thesis = ic_analysis.get("thesis", "")
+    rec    = ic_analysis.get("rec", "")
+    risks  = ic_analysis.get("risks", []) or []
+    threshold_status = ic_analysis.get("threshold_status", {}) or {}
+    dev_ic = ic_analysis.get("dev_ic", {}) or {}
+
+    # Sensitivity (프론트에서 계산된 값)
+    scenarios = data.get("scenarios", []) or []
+
+    # Threshold 메타
+    thresholds = data.get("thresholds", {}) or {}
+    thr_irr = thresholds.get("sponsor_irr_pct", 9.0)
+    thr_margin = thresholds.get("dev_margin_cwp", 10.0)
+
+    # 위험 항목 렌더
+    risks_html = ""
+    sev_color = {"Critical": "#DC2626", "Watch": "#D97706", "OK": "#059669"}
+    for i, r in enumerate(risks[:8]):
+        sev = r.get("severity", "OK")
+        c = sev_color.get(sev, "#6B7280")
+        title = _esc_html(r.get("title", ""))
+        detail = _esc_html(r.get("detail", ""))
+        risks_html += f"""
+        <div class="risk-item">
+          <div class="risk-header">
+            <span class="risk-num">{i+1:02d}</span>
+            <span class="risk-title">{title}</span>
+            <span class="risk-sev" style="background:{c}">{sev}</span>
+          </div>
+          <div class="risk-detail">{detail}</div>
+        </div>
+        """
+
+    # Scenario 테이블
+    scen_rows = ""
+    for s in scenarios:
+        scen_rows += f"""
+        <tr>
+          <td class="scen-name">{_esc_html(s.get('name','—'))}</td>
+          <td class="scen-val">{_esc_html(s.get('irr','—'))}</td>
+          <td class="scen-val">{_esc_html(s.get('margin','—'))}</td>
+        </tr>
+        """
+
+    # Threshold 체크
+    def _chk(ok):
+        return ('<span style="color:#059669;font-weight:700">✓ PASS</span>' if ok
+                else '<span style="color:#DC2626;font-weight:700">✗ FAIL</span>')
+    thr_irr_ok = threshold_status.get("irr_ok", False)
+    thr_margin_ok = threshold_status.get("margin_ok", False)
+    thr_irr_gap = _esc_html(threshold_status.get("irr_gap", ""))
+    thr_margin_gap = _esc_html(threshold_status.get("margin_gap", ""))
+
+    # HTML 조립
+    html = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>IC Summary - {_esc_html(proj_name)}</title>
+<style>
+@page {{
+  size: A4 portrait;
+  margin: 18mm 16mm 18mm 16mm;
+  @bottom-center {{
+    content: counter(page) " / " counter(pages);
+    font-family: 'Noto Sans KR', 'Helvetica', sans-serif;
+    font-size: 8pt;
+    color: #6B7280;
+  }}
+  @bottom-left {{
+    content: "Hanwha Energy USA Holdings · Internal IC Memo";
+    font-family: 'Noto Sans KR', 'Helvetica', sans-serif;
+    font-size: 7pt;
+    color: #9CA3AF;
+  }}
+  @bottom-right {{
+    content: "{_esc_html(today)}";
+    font-family: 'Noto Sans KR', 'Helvetica', sans-serif;
+    font-size: 7pt;
+    color: #9CA3AF;
+  }}
+}}
+@page :first {{
+  @bottom-center {{ content: none; }}
+  @bottom-left {{ content: none; }}
+  @bottom-right {{ content: none; }}
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  font-family: 'Noto Sans KR', 'Helvetica Neue', Helvetica, sans-serif;
+  font-size: 10pt;
+  line-height: 1.55;
+  color: #111827;
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+}}
+
+/* ── Cover ────────────────────────────────────── */
+.cover {{
+  height: 260mm;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 20mm 8mm 8mm 8mm;
+}}
+.cover-header {{
+  font-size: 8pt;
+  font-weight: 600;
+  color: #6B7280;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  border-bottom: 1px solid #E5E7EB;
+  padding-bottom: 12pt;
+}}
+.cover-main {{
+  margin-top: 40mm;
+}}
+.cover-tag {{
+  font-size: 9pt;
+  font-weight: 600;
+  color: {v_color};
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  margin-bottom: 10pt;
+}}
+.cover-title {{
+  font-size: 36pt;
+  font-weight: 800;
+  color: #111827;
+  letter-spacing: -1.2pt;
+  line-height: 1.05;
+  margin-bottom: 14pt;
+}}
+.cover-sub {{
+  font-size: 12pt;
+  color: #4B5563;
+  font-weight: 400;
+  margin-bottom: 40pt;
+}}
+.cover-verdict {{
+  display: inline-block;
+  padding: 10pt 22pt;
+  border: 2pt solid {v_color};
+  border-radius: 2pt;
+  font-size: 22pt;
+  font-weight: 800;
+  color: {v_color};
+  letter-spacing: 4pt;
+}}
+.cover-stats {{
+  display: flex;
+  gap: 20pt;
+  margin-top: 24pt;
+}}
+.cover-stat {{
+  flex: 1;
+  border-left: 2pt solid #E5E7EB;
+  padding-left: 10pt;
+}}
+.cover-stat-label {{
+  font-size: 7pt;
+  font-weight: 700;
+  color: #6B7280;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 3pt;
+}}
+.cover-stat-value {{
+  font-size: 16pt;
+  font-weight: 700;
+  color: #111827;
+  font-variant-numeric: tabular-nums;
+}}
+.cover-footer {{
+  margin-top: auto;
+  padding-top: 20pt;
+  border-top: 1px solid #E5E7EB;
+  display: flex;
+  justify-content: space-between;
+  font-size: 8pt;
+  color: #6B7280;
+}}
+
+/* ── Content Pages ────────────────────────────── */
+.page-break {{ page-break-before: always; }}
+
+h1 {{
+  font-size: 14pt;
+  font-weight: 800;
+  color: #111827;
+  margin: 0 0 3pt 0;
+  letter-spacing: -0.3pt;
+}}
+.section-sub {{
+  font-size: 8pt;
+  color: #6B7280;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 12pt;
+  border-bottom: 1pt solid #E5E7EB;
+  padding-bottom: 6pt;
+}}
+h2 {{
+  font-size: 10pt;
+  font-weight: 700;
+  color: #111827;
+  margin: 14pt 0 6pt 0;
+  letter-spacing: 0;
+}}
+p {{ margin: 4pt 0; color: #1F2937; }}
+
+/* Metrics Grid */
+.metrics-grid {{
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6pt;
+  margin-bottom: 14pt;
+}}
+.metric-card {{
+  padding: 8pt 10pt;
+  border: 0.5pt solid #D1D5DB;
+  border-radius: 2pt;
+}}
+.metric-card-primary {{
+  border-left: 2.5pt solid #059669;
+}}
+.metric-card-secondary {{
+  border-left: 2.5pt solid #D97706;
+}}
+.metric-card-wacc {{
+  border-left: 2.5pt solid #2563EB;
+}}
+.metric-label {{
+  font-size: 7pt;
+  font-weight: 700;
+  color: #6B7280;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 3pt;
+}}
+.metric-value {{
+  font-size: 15pt;
+  font-weight: 700;
+  color: #111827;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}}
+.metric-sub {{
+  font-size: 7pt;
+  color: #6B7280;
+  margin-top: 2pt;
+}}
+
+/* Financial table */
+.fin-table {{
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 9pt;
+  margin: 8pt 0 14pt 0;
+}}
+.fin-table th {{
+  text-align: left;
+  padding: 6pt 8pt;
+  border-bottom: 1pt solid #111827;
+  font-size: 7pt;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #374151;
+}}
+.fin-table td {{
+  padding: 5pt 8pt;
+  border-bottom: 0.3pt solid #E5E7EB;
+  font-variant-numeric: tabular-nums;
+}}
+.fin-table td.val {{ text-align: right; font-weight: 600; }}
+.fin-table tr.subtotal td {{
+  background: #F9FAFB;
+  font-weight: 700;
+  border-top: 0.5pt solid #6B7280;
+}}
+
+/* Threshold check */
+.thr-box {{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10pt;
+  margin: 10pt 0;
+}}
+.thr-item {{
+  padding: 10pt 12pt;
+  border: 1pt solid #E5E7EB;
+  border-radius: 2pt;
+  background: #F9FAFB;
+}}
+.thr-label {{
+  font-size: 8pt;
+  font-weight: 600;
+  color: #6B7280;
+  margin-bottom: 4pt;
+}}
+.thr-status {{ font-size: 11pt; margin-bottom: 3pt; }}
+.thr-gap {{ font-size: 9pt; color: #374151; }}
+
+/* Thesis / Recommendation boxes */
+.thesis-box {{
+  padding: 12pt 14pt;
+  background: #F9FAFB;
+  border-left: 3pt solid #2563EB;
+  border-radius: 0 2pt 2pt 0;
+  margin: 10pt 0;
+  font-size: 10pt;
+  line-height: 1.7;
+  color: #1F2937;
+}}
+.rec-box {{
+  padding: 14pt 16pt;
+  background: #FEF3C7;
+  border-left: 3pt solid #D97706;
+  border-radius: 0 2pt 2pt 0;
+  margin: 10pt 0;
+  font-size: 10pt;
+  line-height: 1.7;
+  color: #78350F;
+  font-weight: 500;
+}}
+
+/* Risk items */
+.risk-item {{
+  padding: 10pt 0;
+  border-bottom: 0.5pt solid #E5E7EB;
+}}
+.risk-item:last-child {{ border-bottom: none; }}
+.risk-header {{
+  display: flex;
+  align-items: center;
+  gap: 8pt;
+  margin-bottom: 4pt;
+}}
+.risk-num {{
+  font-size: 8pt;
+  font-weight: 700;
+  color: #9CA3AF;
+  font-variant-numeric: tabular-nums;
+  min-width: 18pt;
+}}
+.risk-title {{
+  font-size: 10pt;
+  font-weight: 700;
+  color: #111827;
+  flex: 1;
+}}
+.risk-sev {{
+  color: #fff;
+  font-size: 7pt;
+  font-weight: 700;
+  padding: 2pt 7pt;
+  border-radius: 2pt;
+  letter-spacing: 0.05em;
+}}
+.risk-detail {{
+  font-size: 9pt;
+  color: #4B5563;
+  line-height: 1.6;
+  margin-left: 26pt;
+}}
+
+/* Scenario table */
+.scen-table {{
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 9pt;
+  margin: 8pt 0;
+}}
+.scen-table th {{
+  text-align: left;
+  padding: 7pt 10pt;
+  background: #111827;
+  color: #fff;
+  font-size: 7.5pt;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}}
+.scen-table td {{
+  padding: 7pt 10pt;
+  border-bottom: 0.5pt solid #E5E7EB;
+}}
+.scen-name {{ font-weight: 700; color: #111827; }}
+.scen-val {{ font-variant-numeric: tabular-nums; text-align: right; }}
+
+/* Dev IC Grid */
+.devic-grid {{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10pt;
+  margin: 10pt 0;
+}}
+.devic-item {{
+  padding: 9pt 12pt;
+  border: 0.5pt solid #E5E7EB;
+  border-radius: 2pt;
+  background: #FEFEFE;
+}}
+.devic-label {{
+  font-size: 7pt;
+  font-weight: 700;
+  color: #6B7280;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 3pt;
+}}
+.devic-value {{
+  font-size: 9pt;
+  color: #1F2937;
+  line-height: 1.5;
+}}
+
+/* Footer note */
+.confidential-note {{
+  margin-top: 20pt;
+  padding-top: 10pt;
+  border-top: 0.3pt solid #E5E7EB;
+  font-size: 7pt;
+  color: #9CA3AF;
+  font-style: italic;
+  text-align: center;
+}}
+</style>
+</head>
+<body>
+
+<!-- ══ COVER PAGE ══ -->
+<div class="cover">
+  <div>
+    <div class="cover-header">Hanwha Energy USA Holdings · Investment Committee Memo</div>
+  </div>
+
+  <div class="cover-main">
+    <div class="cover-tag">Confidential · Internal Use Only</div>
+    <div class="cover-title">{_esc_html(proj_name)}</div>
+    <div class="cover-sub">{_esc_html(pv_mwac)} MWac Solar + BESS · {_esc_html(state)} ({_esc_html(iso)}) · COD {_esc_html(cod)}</div>
+
+    <div class="cover-verdict">{_esc_html(verdict)}</div>
+
+    <div class="cover-stats">
+      <div class="cover-stat">
+        <div class="cover-stat-label">Sponsor IRR</div>
+        <div class="cover-stat-value">{irr_lev_pre}</div>
+      </div>
+      <div class="cover-stat">
+        <div class="cover-stat-label">Dev Margin</div>
+        <div class="cover-stat-value">{dev_margin}</div>
+      </div>
+      <div class="cover-stat">
+        <div class="cover-stat-label">Total CAPEX</div>
+        <div class="cover-stat-value">{capex}</div>
+      </div>
+      <div class="cover-stat">
+        <div class="cover-stat-label">WACC</div>
+        <div class="cover-stat-value">{wacc_val}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cover-footer">
+    <span>Prepared: {_esc_html(today)}</span>
+    <span>{_esc_html(data.get("prepared_by",""))}</span>
+  </div>
+</div>
+
+<!-- ══ PAGE 2 — EXECUTIVE SUMMARY ══ -->
+<div class="page-break">
+  <h1>Executive Summary</h1>
+  <div class="section-sub">투자 의견 · 핵심 논거</div>
+
+  <h2>투자 논거 (Investment Thesis)</h2>
+  <div class="thesis-box">{_esc_html(thesis) if thesis else "(AI 분석 미완료 — IC Opinion 탭에서 Run AI Analysis 실행 후 재생성)"}</div>
+
+  <h2>행동 권고 (Recommendation)</h2>
+  <div class="rec-box">{_esc_html(rec) if rec else "(AI 분석 미완료)"}</div>
+
+  <h2>Development IC 평가</h2>
+  <div class="devic-grid">
+    <div class="devic-item">
+      <div class="devic-label">NTP 달성 확률</div>
+      <div class="devic-value">{_esc_html(dev_ic.get("ntp_prob",""))}</div>
+    </div>
+    <div class="devic-item">
+      <div class="devic-label">ITC Expiry 평가</div>
+      <div class="devic-value">{_esc_html(dev_ic.get("itc_expiry_verdict",""))}</div>
+    </div>
+    <div class="devic-item">
+      <div class="devic-label">Safe Harbor</div>
+      <div class="devic-value">{_esc_html(dev_ic.get("safe_harbor",""))}</div>
+    </div>
+    <div class="devic-item">
+      <div class="devic-label">개발 단계</div>
+      <div class="devic-value">{_esc_html(dev_ic.get("stage_ok",""))}</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ PAGE 3 — FINANCIAL SUMMARY ══ -->
+<div class="page-break">
+  <h1>Financial Summary</h1>
+  <div class="section-sub">재무 지표 · 자본 구조 · 계약 조건</div>
+
+  <h2>Returns Detail</h2>
+  <div class="metrics-grid">
+    <div class="metric-card metric-card-primary">
+      <div class="metric-label">Sponsor IRR</div>
+      <div class="metric-value">{irr_lev_pre}</div>
+      <div class="metric-sub">Levered · Pre-Tax</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Sponsor IRR</div>
+      <div class="metric-value">{irr_at_before}</div>
+      <div class="metric-sub">After-Tax (Before NOL)</div>
+    </div>
+    <div class="metric-card metric-card-secondary">
+      <div class="metric-label">Sponsor IRR</div>
+      <div class="metric-value">{irr_at_after}</div>
+      <div class="metric-sub">After-Tax (After NOL)</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Project IRR</div>
+      <div class="metric-value">{irr_unlev}</div>
+      <div class="metric-sub">Unlevered · Pre-Tax</div>
+    </div>
+    <div class="metric-card metric-card-wacc">
+      <div class="metric-label">WACC</div>
+      <div class="metric-value">{wacc_val}</div>
+      <div class="metric-sub">Capital Cost · Hurdle</div>
+    </div>
+  </div>
+
+  <h2>Investment Thresholds (기준 달성)</h2>
+  <div class="thr-box">
+    <div class="thr-item">
+      <div class="thr-label">Sponsor IRR (Levered Pre-Tax, min {thr_irr}%)</div>
+      <div class="thr-status">{_chk(thr_irr_ok)}</div>
+      <div class="thr-gap">{thr_irr_gap}</div>
+    </div>
+    <div class="thr-item">
+      <div class="thr-label">Dev Margin (min {thr_margin} c/Wp)</div>
+      <div class="thr-status">{_chk(thr_margin_ok)}</div>
+      <div class="thr-gap">{thr_margin_gap}</div>
+    </div>
+  </div>
+
+  <h2>Capital Structure & Deal Terms</h2>
+  <table class="fin-table">
+    <thead><tr><th>Item</th><th style="text-align:right">Value</th></tr></thead>
+    <tbody>
+      <tr><td>Total CAPEX</td><td class="val">{capex}</td></tr>
+      <tr><td>Senior Debt</td><td class="val">{debt}</td></tr>
+      <tr><td>Tax Equity</td><td class="val">{te}</td></tr>
+      <tr><td>Sponsor Equity</td><td class="val">{eq}</td></tr>
+      <tr class="subtotal"><td>Dev Margin</td><td class="val">{dev_margin} ({margin_cwp_str})</td></tr>
+      <tr><td>EBITDA Yield (Y1)</td><td class="val">{ebitda_y_str}</td></tr>
+      <tr><td>PPA Price × Term</td><td class="val">${_esc_html(ppa_price)}/MWh × {_esc_html(ppa_term)}yr</td></tr>
+      <tr><td>BESS Toll</td><td class="val">${_esc_html(bess_toll)}/kW-mo</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Scenario Analysis</h2>
+  <table class="scen-table">
+    <thead><tr><th>Scenario</th><th style="text-align:right">Sponsor IRR</th><th style="text-align:right">Dev Margin</th></tr></thead>
+    <tbody>{scen_rows if scen_rows else '<tr><td colspan="3" style="color:#9CA3AF;text-align:center">시나리오 미실행</td></tr>'}</tbody>
+  </table>
+</div>
+
+<!-- ══ PAGE 4 — RISK ASSESSMENT ══ -->
+<div class="page-break">
+  <h1>Risk Assessment</h1>
+  <div class="section-sub">개발 리스크 · 재무 리스크 · 외부 리스크</div>
+
+  {risks_html if risks_html else '<p style="color:#9CA3AF">AI 분석 미완료 — IC Opinion 탭에서 Run AI Analysis 실행 후 재생성</p>'}
+
+  <div class="confidential-note">
+    본 문서는 Hanwha Energy USA Holdings 내부 투자심의 목적으로만 작성되었으며, 외부 유출을 금합니다.<br>
+    수치 및 가정은 {_esc_html(today)} 기준 엑셀 재무모델 및 시장 데이터를 근거로 하며, 시장 변동에 따라 달라질 수 있습니다.
+  </div>
+</div>
+
+</body>
+</html>"""
+    return html
+
+
+@app.post("/valuation/export-pdf")
+async def export_ic_pdf(payload: dict, user=Depends(get_current_user)):
+    """IC Summary PDF 생성 (WeasyPrint, world-class formatting)."""
+    try:
+        from weasyprint import HTML
+    except ImportError:
+        raise HTTPException(
+            500,
+            "WeasyPrint가 설치되지 않았습니다. requirements.txt에 weasyprint 추가 후 재배포하세요."
+        )
+
+    html_str = _build_ic_pdf_html(payload)
+    try:
+        pdf_bytes = HTML(string=html_str).write_pdf()
+    except Exception as e:
+        raise HTTPException(500, f"PDF 생성 오류: {str(e)[:200]}")
+
+    proj_name = payload.get("project_name", "IC_Summary").replace(" ", "_")
+    date_str = payload.get("date", datetime.date.today().isoformat()).replace("-", "")
+    filename = f"IC_Summary_{proj_name}_{date_str}.pdf"
+
+    return _Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
 @app.post("/valuation/analyze-cf")
 async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     """CF 데이터를 Claude API로 분석하여 인사이트 반환"""
@@ -1389,7 +2240,22 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "   RECUT: threshold miss OR one Critical development risk fixable by sponsor\n"
         "   PASS: IRR unrecoverable OR Critical development risk not fixable\n"
         "   Headroom above threshold is a STRONG positive — say so explicitly.\n"
-        f"Respond in {'English' if payload.get('lang','en')=='en' else 'Korean'} only.\n"
+        "\n"
+        "═══ LANGUAGE (CRITICAL) ═══\n"
+        + ("ALL text fields MUST be written in KOREAN (한국어). This includes:\n"
+           "- threshold_status.irr_gap / margin_gap (e.g., '기준 대비 +1.5%p 여유')\n"
+           "- dev_ic.ntp_prob / itc_expiry_verdict / safe_harbor / stage_ok (full Korean sentences)\n"
+           "- sensitivity_kr (Korean required; sensitivity_en can stay English)\n"
+           "- thesis: Korean investment thesis, formal business tone (존대체)\n"
+           "- risks[].title, risks[].detail: Korean titles and descriptions\n"
+           "- rec: Korean recommendation, 2-3 sentences, actionable\n"
+           "Only 'verdict' (PROCEED/RECUT/PASS) and 'verdict_color' (green/amber/red) stay English.\n"
+           "Financial numbers with units can stay in English form (e.g., '10.38%', '$68.82/MWh').\n"
+           "DO NOT mix English and Korean in the same field except for numbers/units.\n"
+           if payload.get("lang","en")=="kr" else
+           "ALL text fields in ENGLISH only. Formal institutional investor tone.\n"
+           "threshold_status.irr_gap / margin_gap / dev_ic fields / thesis / risks / rec all in English.\n")
+        + "\n"
         "Be direct. Cite specific numbers. No hedging.\n\n"
         "Respond ONLY with valid JSON (no markdown, no code blocks).\n"
         "Required keys:\n"
@@ -1397,7 +2263,9 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "verdict_color: green / amber / red\n"
         "threshold_status: {irr_ok:bool, irr_gap:str, margin_ok:bool, margin_gap:str, itc_ok:bool}\n"
         "dev_ic: {ntp_prob:str, itc_expiry_verdict:str, safe_harbor:str, stage_ok:str}\n"
-        "metrics: one-line key metrics string\n"
+        "metrics: ONE compact line, under 120 chars, pipe-delimited. "
+        "Example: '199 MWac | 10.4% IRR | $39.8M Margin | $68.8 PPA | $836M CAPEX | 30% ITC'. "
+        "Use short units (no 'dev margin', no 'c/Wp' in parentheses). Keep each token tight.\n"
         "sensitivity_en: dev margin upside/downside in English with c/Wp numbers\n"
         "sensitivity_kr: same in Korean\n"
         "thesis: 3-4 sentence investment thesis\n"
