@@ -406,7 +406,7 @@ def _stooq_fetch(symbol: str, days: int = 180):
         return None
 
 def _summarize_series(points):
-    """시계열 → 최신값/변동/스파크라인 요약."""
+    """시계열 → 최신값/변동/스파크라인 요약 (1년치)."""
     if not points:
         return None
     latest = points[-1]
@@ -415,13 +415,20 @@ def _summarize_series(points):
     week_ago = points[-6] if len(points) >= 6 else points[0]
     # 약 한달 전 (영업일 21개 전)
     month_ago = points[-22] if len(points) >= 22 else points[0]
+    # 약 1년 전 (영업일 252개 전)
+    year_ago = points[-253] if len(points) >= 253 else points[0]
+    # 1년치 주간 샘플링 (52포인트 내외) — 주 1회 데이터만 추출
+    # 영업일 기준 5일마다 1개 선택
+    sampled = points[::5] if len(points) > 60 else points
     return {
         "latest": latest["value"],
         "latest_date": latest["date"],
         "d_1d": latest["value"] - prev["value"],
         "d_1w": latest["value"] - week_ago["value"],
         "d_1m": latest["value"] - month_ago["value"],
-        "spark": [p["value"] for p in points[-30:]],  # 최근 30포인트
+        "d_1y": latest["value"] - year_ago["value"],
+        "spark": [p["value"] for p in sampled],
+        "spark_dates": [p["date"] for p in sampled],  # 실제 날짜 병행 전달
         "n_points": len(points),
     }
 
@@ -452,9 +459,9 @@ def get_market_benchmark(force: int = 0, user=Depends(get_current_user)):
         "series": {},
     }
 
-    # FRED 시리즈
+    # FRED 시리즈 (1년치)
     for key, meta in FRED_SERIES.items():
-        pts = _fred_fetch(meta["id"], days=400 if key == "cpi" else 180)
+        pts = _fred_fetch(meta["id"], days=400 if key == "cpi" else 365)
         summary = _summarize_series(pts) if pts else None
         result["series"][key] = {
             **meta,
@@ -462,9 +469,9 @@ def get_market_benchmark(force: int = 0, user=Depends(get_current_user)):
             "ok": summary is not None,
         }
 
-    # Stooq 시리즈
+    # Stooq 시리즈 (1년치)
     for key, meta in STOOQ_SYMBOLS.items():
-        pts = _stooq_fetch(meta["symbol"], days=180)
+        pts = _stooq_fetch(meta["symbol"], days=365)
         summary = _summarize_series(pts) if pts else None
         result["series"][key] = {
             **meta,
