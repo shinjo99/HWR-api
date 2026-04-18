@@ -3059,13 +3059,17 @@ async def save_valuation_version(
     payload: dict,
     user=Depends(get_current_user)
 ):
-    """버전 저장 → 100개 한도, 승인 대기 status"""
+    """버전 저장 → 즉시 저장 (승인 flow 제거). 100개 한도."""
     safe_id = project_id.replace("/", "_").replace(".", "_")
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     payload["uploaded_by"] = user["email"]
     payload["uploaded_at"] = datetime.datetime.now().isoformat()
-    payload["status"] = "pending"
+    # 승인 flow 제거 → 즉시 "saved" 상태
+    payload["status"] = "saved"
     payload["requested_by"] = user["email"]
+    # "approver" 필드 레거시 호환: 존재하면 "shared_with"로 마이그레이트
+    if "approver" in payload and payload["approver"] and "shared_with" not in payload:
+        payload["shared_with"] = payload["approver"]
 
     fb_put(f"valuation/{safe_id}/versions/{ts}", payload)
     fb_put(f"valuation/{safe_id}/latest", payload)
@@ -3087,11 +3091,13 @@ async def save_valuation_version(
     return {"ok": True, "timestamp": ts}
 
 
+# 레거시 승인/반려 엔드포인트 — 하위호환 유지하되 no-op화 (존재하는 pending 버전 정리용)
 @app.post("/valuation/{project_id}/versions/{ts}/approve")
 def approve_version(project_id: str, ts: str, user=Depends(require_admin)):
+    """[Deprecated] 승인 flow 제거됨. 하위호환용: pending을 saved로 마이그레이트."""
     safe_id = project_id.replace("/", "_").replace(".", "_")
     fb_patch(f"valuation/{safe_id}/versions/{ts}", {
-        "status": "approved",
+        "status": "saved",
         "approved_by": user["email"],
         "approved_at": datetime.datetime.now().isoformat()
     })
@@ -3100,6 +3106,7 @@ def approve_version(project_id: str, ts: str, user=Depends(require_admin)):
 
 @app.post("/valuation/{project_id}/versions/{ts}/reject")
 def reject_version(project_id: str, ts: str, body: dict = {}, user=Depends(require_admin)):
+    """[Deprecated] 승인 flow 제거됨. 하위호환용: 버전 삭제."""
     safe_id = project_id.replace("/", "_").replace(".", "_")
     fb_patch(f"valuation/{safe_id}/versions/{ts}", {
         "status": "rejected",
