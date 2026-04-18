@@ -562,22 +562,57 @@ async def upload_levelten(
             "content-type": "application/json",
         }
         prompt = (
-            "You are parsing a LevelTen Energy PPA Price Index report. "
-            "Extract ALL regional PPA pricing data into strict JSON (no markdown, no prose).\n\n"
+            "You are parsing a LevelTen Energy PPA Price Index report for a Solar+BESS developer. "
+            "Extract structured data into strict JSON (no markdown, no prose).\n\n"
+            "IMPORTANT PRINCIPLES:\n"
+            "1. We focus on Solar PPA and BESS Storage pricing. Skip Wind data entirely.\n"
+            "2. ONLY extract values that are explicitly present in the report — tables, charts, or text.\n"
+            "3. DO NOT estimate, guess, or use general market knowledge to fill missing values.\n"
+            "4. If a value is not in the report, use null. It is BETTER to return null than to invent data.\n"
+            "5. For chart-read values (Storage Price Spreads typically shown as charts only), estimate to nearest $0.5 and mark source as 'chart_read'.\n\n"
+
             "Required schema:\n"
             "{\n"
             '  "quarter": "YYYY-QN",\n'
             '  "report_date": "YYYY-MM-DD or null",\n'
-            '  "entries": [\n'
-            '    {"tech":"solar|wind|storage", "region":"ERCOT|PJM|MISO|CAISO|SPP|NYISO|ISO-NE|WECC|SERC|...",\n'
-            '     "term_yr":10, "p25": <number $/MWh>, "p50": <number or null>, "p75": <number or null>}\n'
+            '  "solar_iso": [\n'
+            '    {"region":"ERCOT|PJM|MISO|CAISO|SPP|NYISO|ISO-NE|AESO", "p25":<number $/MWh>,\n'
+            '     "qoq_pct":<number or null>, "yoy_pct":<number or null>}\n'
             "  ],\n"
-            '  "notes": "brief description of trends mentioned in the report (1-2 sentences)"\n'
+            '  "solar_continental": {\n'
+            '    "p25":<number>, "p50":<number>, "p75":<number>,\n'
+            '    "p10":<number or null>, "p90":<number or null>,\n'
+            '    "qoq_pct":<number or null>, "yoy_pct":<number or null>\n'
+            "  },\n"
+            '  "solar_hub": [\n'
+            '    {"region":"ERCOT", "hub":"North|West|South|Houston|...", "p25":<number>}\n'
+            "  ],\n"
+            '  "storage_iso": [\n'
+            '    {"region":"ERCOT|PJM|CAISO|MISO|SPP|AESO|...", \n'
+            '     "p25":<number $/kW-month or null>, "p50":<number or null>, "p75":<number or null>,\n'
+            '     "source":"table|chart_read"}\n'
+            "  ],\n"
+            '  "storage_available": <true if BESS data found in report, false otherwise>,\n'
+            '  "storage_note": "description of BESS data source (e.g., \\"Price spreads chart on page X\\", or \\"Not included in report\\")",\n'
+            '  "key_insights": ["1-line insight 1", "1-line insight 2", ...],\n'
+            '  "notes": "2-3 sentence summary of quarter trends (Solar + Storage focus)"\n'
             "}\n\n"
-            "Rules:\n"
-            "- p25/p50/p75 are USD per MWh.\n"
-            "- If only one price tier is shown, put it in p25.\n"
-            "- Extract every region × tech × term combination found.\n"
+
+            "BESS Storage Extraction Rules (CRITICAL):\n"
+            "- LevelTen reports TYPICALLY show Storage Price Spreads as a CHART (not a table).\n"
+            "- If a Storage Price Spreads chart exists: read P25 (low end), P50 (median line), P75 (high end) visually.\n"
+            "  Round to nearest $0.5. Mark source='chart_read'.\n"
+            "- If Storage Duration Distribution chart exists, note it in storage_note (but don't parse).\n"
+            "- If NO BESS/Storage section exists: set storage_iso=[], storage_available=false, \n"
+            "  storage_note='BESS pricing data not provided in this report'.\n"
+            "- NEVER invent BESS prices. If unsure, leave as null rather than guess.\n\n"
+
+            "General Rules:\n"
+            "- Solar prices: USD/MWh. Storage prices: USD/kW-month (levelized tolling).\n"
+            "- QoQ/YoY: percent change (e.g., 3.2 means +3.2%).\n"
+            "- Include ALL ISOs mentioned for Solar (typically 6-8 regions).\n"
+            "- key_insights: extract 3-5 most actionable data points for a Solar+BESS developer.\n"
+            "- DO NOT include any Wind data in the output.\n"
             "- Return ONLY the JSON object. No explanation. No code fences."
         )
         body = {
@@ -621,19 +656,27 @@ async def upload_levelten(
             "content-type": "application/json",
         }
         prompt = (
-            "You are parsing LevelTen Energy PPA Price Index tabular data. "
+            "You are parsing LevelTen Energy PPA Price Index tabular data for a Solar+BESS developer. "
             f"The data below is from a {parse_mode.upper()} export.\n\n"
             f"DATA:\n{source_text[:30000]}\n\n"
+            "IMPORTANT PRINCIPLES:\n"
+            "1. We focus on Solar PPA and BESS Storage pricing. Skip Wind data.\n"
+            "2. ONLY extract values that are EXPLICITLY present in the data. NEVER estimate or invent.\n"
+            "3. If a value is missing, use null. Do NOT fill with guesses.\n\n"
             "Extract into strict JSON (no markdown, no prose):\n"
             "{\n"
             '  "quarter": "YYYY-QN",\n'
             '  "report_date": "YYYY-MM-DD or null",\n'
-            '  "entries": [\n'
-            '    {"tech":"solar|wind|storage", "region":"ERCOT|PJM|MISO|...",\n'
-            '     "term_yr":10, "p25":<number $/MWh>, "p50":<number or null>, "p75":<number or null>}\n'
-            "  ],\n"
-            '  "notes": "brief trend summary"\n'
+            '  "solar_iso": [{"region":"ERCOT|PJM|MISO|CAISO|SPP|ISO-NE|AESO", "p25":<$/MWh>, "qoq_pct":<null>, "yoy_pct":<null>}],\n'
+            '  "solar_continental": {"p25":<number>, "p50":<number>, "p75":<number>, "p10":<number|null>, "p90":<number|null>, "qoq_pct":<null>, "yoy_pct":<null>},\n'
+            '  "solar_hub": [{"region":"ERCOT", "hub":"North", "p25":<number>}],\n'
+            '  "storage_iso": [{"region":"ERCOT|...", "p25":<$/kW-month|null>, "p50":<number|null>, "p75":<number|null>, "source":"table"}],\n'
+            '  "storage_available": <true|false>,\n'
+            '  "storage_note": "description or \\"Not included in data\\"",\n'
+            '  "key_insights": ["actionable insight 1", "insight 2"],\n'
+            '  "notes": "2-3 sentence summary (Solar+Storage focus, no Wind)"\n'
             "}\n"
+            "If NO storage data in file: storage_iso=[], storage_available=false.\n"
             "Return ONLY the JSON object. No code fences."
         )
         body = {
@@ -673,10 +716,28 @@ async def upload_levelten(
     parsed["filename"] = filename
     parsed["parse_mode"] = parse_mode
 
+    # Backward compat: 새 파서 스키마를 legacy entries 배열로도 변환
+    if "entries" not in parsed:
+        legacy = []
+        for s in parsed.get("solar_iso", []) or []:
+            legacy.append({"tech":"solar", "region": s.get("region",""), "term_yr":10,
+                           "p25": s.get("p25"), "p50": None, "p75": None})
+        for s in parsed.get("storage_iso", []) or []:
+            legacy.append({"tech":"storage", "region": s.get("region",""), "term_yr":10,
+                           "p25": s.get("p25"), "p50": s.get("p50"), "p75": s.get("p75")})
+        parsed["entries"] = legacy
+
     # Firebase 저장: benchmark/levelten/{quarter}
     fb_put(f"benchmark/levelten/{quarter}", parsed)
 
-    return {"ok": True, "quarter": quarter, "entries_count": len(parsed.get("entries", [])), "data": parsed}
+    return {
+        "ok": True,
+        "quarter": quarter,
+        "solar_iso_count": len(parsed.get("solar_iso", []) or []),
+        "storage_iso_count": len(parsed.get("storage_iso", []) or []),
+        "entries_count": len(parsed.get("entries", []) or []),
+        "data": parsed,
+    }
 
 
 @app.get("/benchmark/levelten")
@@ -747,6 +808,154 @@ def save_peer_irr(payload: dict, user=Depends(get_current_user)):
     data["updated_by"] = user["email"]
     fb_put("benchmark/peer_irr", data)
     return {"ok": True, "data": data}
+
+
+# ══════════════════════════════════════════════════
+#  BESS Tolling Market Research (AI Web Search)
+# ══════════════════════════════════════════════════
+@app.post("/benchmark/bess-tolling/research")
+def research_bess_tolling(user=Depends(get_current_user)):
+    """
+    Claude API + web_search 도구로 ISO별 BESS tolling 가격을 실시간 리서치.
+    결과: ISO × Duration 별 P25/P75 + 출처 URL + confidence score.
+    캐시: benchmark/bess_tolling/latest (수동 새로고침)
+    """
+    if not ANTHROPIC_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY 미설정")
+
+    today_str = datetime.date.today().isoformat()
+
+    prompt = (
+        f"You are an energy market research analyst specializing in US battery energy storage "
+        f"system (BESS) tolling agreements. Today: {today_str}.\n\n"
+        "TASK: Research CURRENT (2025-2026) BESS tolling prices across US ISOs. "
+        "BESS tolling = bilateral agreements where an offtaker pays a monthly capacity fee "
+        "(USD/kW-month, levelized) to use a storage asset. Prices vary by ISO and duration.\n\n"
+        "Use web_search to find recent data from:\n"
+        "- Industry research: Wood Mackenzie, BloombergNEF, S&P Global Market Intelligence, LevelTen, LCG Consulting\n"
+        "- Utility RFP results: EIA, FERC filings, state PUC decisions\n"
+        "- Press releases: NextEra, Invenergy, AES, EDP, Engie, Brookfield BESS deal announcements\n"
+        "- Market reports: ERCOT CDR, CAISO market reports, PJM capacity market auction results\n"
+        "- News: Utility Dive, Greentech Media, Energy Storage News, Reuters\n\n"
+        "Target ISOs: ERCOT, CAISO, PJM, MISO, SPP, ISO-NE\n"
+        "Target durations: 2h, 4h, 6h (most common)\n\n"
+        "For EACH ISO × duration combination, determine:\n"
+        "- P25 (low end of market, 25th percentile)\n"
+        "- P75 (high end of market, 75th percentile)\n"
+        "- At least 2 sources per ISO (URL + publication date)\n\n"
+        "Return ONLY this JSON structure (no markdown, no code fences):\n"
+        "{\n"
+        '  "research_date": "YYYY-MM-DD",\n'
+        '  "iso_data": [\n'
+        '    {\n'
+        '      "region": "ERCOT",\n'
+        '      "durations": [\n'
+        '        {"hours": 2, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"},\n'
+        '        {"hours": 4, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"},\n'
+        '        {"hours": 6, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"}\n'
+        '      ],\n'
+        '      "market_note": "1-2 sentence ISO-specific context (e.g., capacity market dynamics)",\n'
+        '      "sources": [\n'
+        '        {"url": "https://...", "title": "source title", "date": "YYYY-MM", "key_data": "exact quote/figure used"}\n'
+        '      ]\n'
+        '    }\n'
+        '  ],\n'
+        '  "methodology_note": "brief description of how estimates were synthesized",\n'
+        '  "confidence_overall": "high|medium|low",\n'
+        '  "caveats": "1-2 sentence caveats about data quality or gaps"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- All prices in USD/kW-month, levelized over contract term.\n"
+        "- If no data found for a duration, omit it (don't fabricate).\n"
+        "- confidence: 'high' if 3+ sources agree, 'medium' if 2 sources, 'low' if 1 or inference only.\n"
+        "- If an ISO has no reliable recent data, omit that ISO entirely.\n"
+        "- Dates must be 2024-2026 (recent). Reject older data.\n"
+        "- If you cannot find reliable data despite web searching, return iso_data=[] and explain in caveats.\n"
+        "- Return valid JSON only."
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 8000,
+                "tools": [{
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 10,
+                }],
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=180,  # 웹서치 여러 번 → 최대 3분
+        )
+        if resp.status_code != 200:
+            raise HTTPException(502, f"Claude API 오류: {resp.text[:400]}")
+
+        data = resp.json()
+        # content blocks 중 text 타입만 합쳐서 JSON 파싱
+        text_parts = []
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+        full_text = "".join(text_parts).strip()
+
+        # JSON 추출 (code fence 제거 + { } 범위)
+        import re as _re
+        clean = _re.sub(r"```(?:json)?\s*", "", full_text).strip().strip("`")
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+        if start < 0 or end <= start:
+            raise HTTPException(500, f"AI 응답에서 JSON을 찾을 수 없음: {full_text[:300]}")
+        clean = clean[start:end]
+
+        try:
+            parsed = json.loads(clean)
+        except json.JSONDecodeError as e:
+            raise HTTPException(500, f"JSON 파싱 실패: {str(e)}. 응답: {clean[:400]}")
+
+        # 메타데이터 추가
+        parsed["generated_at"] = datetime.datetime.utcnow().isoformat()[:19]
+        parsed["generated_by"] = user["email"]
+        parsed["source"] = "ai_research"
+        # 토큰 사용량 (cost 추적용)
+        usage = data.get("usage", {})
+        parsed["tokens"] = {
+            "input": usage.get("input_tokens", 0),
+            "output": usage.get("output_tokens", 0),
+        }
+
+        # Firebase 저장 (latest로)
+        fb_put("benchmark/bess_tolling/latest", parsed)
+        # 히스토리도 (월별 캐시)
+        month_key = datetime.date.today().strftime("%Y-%m")
+        fb_put(f"benchmark/bess_tolling/history/{month_key}", parsed)
+
+        return {"ok": True, "data": parsed}
+
+    except HTTPException:
+        raise
+    except requests.Timeout:
+        raise HTTPException(504, "AI 리서치 타임아웃 (3분 초과)")
+    except Exception as e:
+        raise HTTPException(500, f"BESS 리서치 실패: {str(e)}")
+
+
+@app.get("/benchmark/bess-tolling")
+def get_bess_tolling(user=Depends(get_current_user)):
+    """저장된 BESS tolling 리서치 결과 조회 (latest)."""
+    return fb_read("benchmark/bess_tolling/latest") or {}
+
+
+@app.get("/benchmark/bess-tolling/history")
+def get_bess_tolling_history(user=Depends(get_current_user)):
+    """월별 히스토리 (stale 확인용)."""
+    return fb_read("benchmark/bess_tolling/history") or {}
 
 
 # ══════════════════════════════════════════════════
@@ -2087,31 +2296,11 @@ p {{ margin: 4pt 0; color: #1F2937; }}
   <h1>Executive Summary</h1>
   <div class="section-sub">투자 의견 · 핵심 논거</div>
 
-  <h2>투자 논거 (Investment Thesis)</h2>
+  <h2>투자 근거 (Investment Rationale)</h2>
   <div class="thesis-box">{_esc_html(thesis) if thesis else "(AI 분석 미완료 — IC Opinion 탭에서 Run AI Analysis 실행 후 재생성)"}</div>
 
-  <h2>행동 권고 (Recommendation)</h2>
+  <h2>Recommendation</h2>
   <div class="rec-box">{_esc_html(rec) if rec else "(AI 분석 미완료)"}</div>
-
-  <h2>Development IC 평가</h2>
-  <div class="devic-grid">
-    <div class="devic-item">
-      <div class="devic-label">NTP 달성 확률</div>
-      <div class="devic-value">{_esc_html(dev_ic.get("ntp_prob",""))}</div>
-    </div>
-    <div class="devic-item">
-      <div class="devic-label">ITC Expiry 평가</div>
-      <div class="devic-value">{_esc_html(dev_ic.get("itc_expiry_verdict",""))}</div>
-    </div>
-    <div class="devic-item">
-      <div class="devic-label">Safe Harbor</div>
-      <div class="devic-value">{_esc_html(dev_ic.get("safe_harbor",""))}</div>
-    </div>
-    <div class="devic-item">
-      <div class="devic-label">개발 단계</div>
-      <div class="devic-value">{_esc_html(dev_ic.get("stage_ok",""))}</div>
-    </div>
-  </div>
 </div>
 
 <!-- ══ PAGE 3 — FINANCIAL SUMMARY ══ -->
@@ -2333,17 +2522,25 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         market_context = payload.get("market_context", {}) or {}
         rates_txt = market_context.get("rates_summary", "")
         levelten_txt = market_context.get("levelten_summary", "")
-        peer_irr_txt = market_context.get("peer_irr_summary", "")
+        bess_tolling_txt = market_context.get("bess_tolling_summary", "")
+        our_bess_duration = market_context.get("our_bess_duration", 4)
 
         market_block = ""
-        if rates_txt or levelten_txt or peer_irr_txt:
+        if rates_txt or levelten_txt or bess_tolling_txt:
             market_block = "=== CURRENT MARKET DATA (most recent; use this INSTEAD of training knowledge) ===\n"
             if rates_txt:
                 market_block += f"  Interest Rates: {rates_txt}\n"
             if levelten_txt:
-                market_block += f"  LevelTen PPA Index: {levelten_txt}\n"
-            if peer_irr_txt:
-                market_block += f"  Peer IRR Benchmarks: {peer_irr_txt}\n"
+                market_block += f"  LevelTen PPA Benchmark: {levelten_txt}\n"
+                market_block += "  → If 'Our ISO' Solar P25 data is provided above, USE IT to compare against project PPA.\n"
+                market_block += "    Reference specifically: 'PPA $X.XX vs LevelTen P25 $Y.YY in {ISO}' for concrete risk commentary.\n"
+            if bess_tolling_txt:
+                market_block += f"  BESS Tolling Market (AI Research, NOT official index): {bess_tolling_txt}\n"
+                market_block += f"  → Project BESS duration: {our_bess_duration}h\n"
+                market_block += "  → USE THIS DATA to benchmark the project's BESS toll rate against market P25-P75 range.\n"
+                market_block += "  → If project toll EXCEEDS market P75 → AUTO-ADD risk 'BESS Toll 시장 상단 초과' (severity: Critical if >20% over, Watch if slight).\n"
+                market_block += "  → If project toll is BELOW market P25 → note 'BESS 수익성 보수적 산정' (positive flag).\n"
+                market_block += "  → Since this is AI-researched (not official LevelTen), ALWAYS caveat: '시장 추정치 기준' / 'AI research-based, not official index'.\n"
             market_block += "\n"
 
         # 경제성 지표 추출 (Unlevered vs WACC 비교용)
@@ -2432,7 +2629,26 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "  - Generic 'market uncertainty' or 'policy risk' without specifics\n\n"
 
         "═══ LANGUAGE ═══\n"
-        + ("ALL text fields in KOREAN (한국어), formal business tone (존대체).\n"
+        + ("ALL text fields in KOREAN (한국어).\n"
+           "\n"
+           "CRITICAL — Korean ENDING STYLE (IC memo convention, formal & concise):\n"
+           "Use short nominal/verbal endings, NOT 존대체 (하다/한다) nor 합쇼체 (합니다).\n"
+           "Required endings:\n"
+           "  - 명사형 종결: '~ 충족', '~ 확인', '~ 권고', '~ 필요', '~ 가능', '~ 부족'\n"
+           "  - 축약 서술: '~됨', '~함', '~임', '~없음', '~확보됨'\n"
+           "Examples (GOOD):\n"
+           "  ✓ '개발 마진 20.0 c/Wp로 기준 대비 +10.0%p 여유 확보'\n"
+           "  ✓ '가중평균자본비용 대비 +0.88%p 상회로 가치 창출 확인'\n"
+           "  ✓ 'PPA 재협상 또는 CAPEX 3% 절감 필요'\n"
+           "  ✓ '경제성 기준 3개 모두 충족, 개발자본 투입 계속 권고'\n"
+           "Examples (BAD — do NOT use):\n"
+           "  ✗ '~제공한다' (→ '~제공')\n"
+           "  ✗ '~확인된다' (→ '~확인됨')\n"
+           "  ✗ '~충족한다' (→ '~충족')\n"
+           "  ✗ '~하도록 한다' (→ '~권고')\n"
+           "  ✗ '~해야 합니다' / '~할 수 있습니다' (too formal/verbose)\n"
+           "Maintain consistency — ALL sentences end in the nominal/concise style.\n"
+           "\n"
            "Only 'verdict' (PROCEED/RECUT/STOP) and 'verdict_color' (green/amber/red) stay English.\n"
            "Financial numbers with units can stay English-style (e.g., '10.38%', '$68.82/MWh').\n"
            "DO NOT mix languages within a single field.\n"
@@ -2453,12 +2669,13 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         "  metrics: ONE compact line, under 120 chars, pipe-delimited.\n"
         "    Example: '199 MWac | 10.4% IRR | $39.8M Margin | $68.8 PPA | $836M CAPEX | 30% ITC'\n"
         "  sensitivity_en: dev margin upside/downside in English with c/Wp numbers\n"
-        "  sensitivity_kr: same in Korean\n"
-        "  thesis: 3-4 sentence economic thesis (왜 이 결정인가)\n"
+        "  sensitivity_kr: same in Korean (nominal ending style)\n"
+        "  thesis: 3-4 sentence economic rationale (경제성 수치 기반 근거)\n"
         "  risks: array of {title, severity: Critical|Watch|OK, detail}\n"
         "    (project-specific only; Safe Harbor/FEOC/BESS ITC are handled separately)\n"
         "  rec: 2-3 sentence actionable recommendation (경제성 관점)\n"
-        "All strings double-quoted. No trailing commas. No extra text outside JSON."
+        "All strings double-quoted. No trailing commas. No extra text outside JSON.\n"
+        "NOTE: Do NOT include 'dev_ic' field — it has been removed from the schema."
     )
 
     resp = requests.post(
@@ -2592,7 +2809,7 @@ async def save_valuation_version(
 
 
 @app.post("/valuation/{project_id}/versions/{ts}/approve")
-def approve_version(project_id: str, ts: str, user=Depends(get_current_user)):
+def approve_version(project_id: str, ts: str, user=Depends(require_admin)):
     safe_id = project_id.replace("/", "_").replace(".", "_")
     fb_patch(f"valuation/{safe_id}/versions/{ts}", {
         "status": "approved",
@@ -2603,7 +2820,7 @@ def approve_version(project_id: str, ts: str, user=Depends(get_current_user)):
 
 
 @app.post("/valuation/{project_id}/versions/{ts}/reject")
-def reject_version(project_id: str, ts: str, body: dict = {}, user=Depends(get_current_user)):
+def reject_version(project_id: str, ts: str, body: dict = {}, user=Depends(require_admin)):
     safe_id = project_id.replace("/", "_").replace(".", "_")
     fb_patch(f"valuation/{safe_id}/versions/{ts}", {
         "status": "rejected",
