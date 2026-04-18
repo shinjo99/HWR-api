@@ -186,6 +186,13 @@ def login(req: LoginRequest):
 def me(user=Depends(get_current_user)):
     return user
 
+@app.get("/auth/admins")
+def get_admins(user=Depends(get_current_user)):
+    """승인자 드롭다운용 admin 목록. 로그인한 사용자라면 조회 가능."""
+    users = get_users()
+    admins = [email for email, u in users.items() if u.get("role") == "admin"]
+    return {"admins": sorted(admins)}
+
 # ══════════════════════════════════════════════════
 #  PPV
 # ══════════════════════════════════════════════════
@@ -585,34 +592,59 @@ async def upload_levelten(
             '    "qoq_pct":<number or null>, "yoy_pct":<number or null>\n'
             "  },\n"
             '  "solar_hub": [\n'
-            '    {"region":"ERCOT", "hub":"North|West|South|Houston|...", "p25":<number>}\n'
+            '    {"region":"ERCOT", "hub":"HB_NORTH|HB_WEST|HB_SOUTH|HB_HOUSTON|SP15|Alberta|WESTERN HUB|DOM|N ILLINOIS HUB|AEP-DAYTON HUB|SPPNORTH_HUB|SPPSOUTH_HUB|MINN.HUB|ILLINOIS.HUB|INDIANA.HUB|LOUISIANA.HUB|ARKANSAS.HUB|...", "p25":<number>}\n'
             "  ],\n"
             '  "storage_iso": [\n'
-            '    {"region":"ERCOT|PJM|CAISO|MISO|SPP|AESO|...", \n'
-            '     "p25":<number $/kW-month or null>, "p50":<number or null>, "p75":<number or null>,\n'
-            '     "source":"table|chart_read"}\n'
+            '    {"region":"AESO|CAISO|ERCOT|MISO|PJM|SPP|...", \n'
+            '     "min":<number or null>, "p25":<number or null>, "median":<number or null>, "p75":<number or null>, "max":<number or null>,\n'
+            '     "source":"levelten_index|chart_read"}\n'
+            "  ],\n"
+            '  "storage_duration_mix": [\n'
+            '    {"region":"ERCOT", "2h":<pct or null>, "3h":<pct or null>, "4h":<pct or null>, "6h":<pct or null>, "8h":<pct or null>, "10h":<pct or null>}\n'
+            "  ],\n"
+            '  "solar_psv": [\n'
+            '    {"region":"ERCOT", "psv_median":<number $/MWh>, "psv_min":<number>, "psv_max":<number>}\n'
+            "  ],\n"
+            '  "pipeline_breakdown": [\n'
+            '    {"cod_year":"2025|2026|2027|2028|2029|2030+", "solar_mw":<number>, "standalone_storage_mw":<number>, "hybrid_mw":<number>}\n'
             "  ],\n"
             '  "storage_available": <true if BESS data found in report, false otherwise>,\n'
-            '  "storage_note": "description of BESS data source (e.g., \\"Price spreads chart on page X\\", or \\"Not included in report\\")",\n'
+            '  "storage_note": "description of BESS data source",\n'
             '  "key_insights": ["1-line insight 1", "1-line insight 2", ...],\n'
             '  "notes": "2-3 sentence summary of quarter trends (Solar + Storage focus)"\n'
             "}\n\n"
 
-            "BESS Storage Extraction Rules (CRITICAL):\n"
-            "- LevelTen reports TYPICALLY show Storage Price Spreads as a CHART (not a table).\n"
-            "- If a Storage Price Spreads chart exists: read P25 (low end), P50 (median line), P75 (high end) visually.\n"
-            "  Round to nearest $0.5. Mark source='chart_read'.\n"
-            "- If Storage Duration Distribution chart exists, note it in storage_note (but don't parse).\n"
-            "- If NO BESS/Storage section exists: set storage_iso=[], storage_available=false, \n"
-            "  storage_note='BESS pricing data not provided in this report'.\n"
-            "- NEVER invent BESS prices. If unsure, leave as null rather than guess.\n\n"
+            "CRITICAL — Storage Extraction:\n"
+            "- LevelTen's 'Storage Price Spreads by ISO' is a BOX PLOT chart showing MIN, P25, MEDIAN, P75, MAX for each ISO.\n"
+            "- Read ALL 5 statistics from the box plot. Round to nearest $0.5. Mark source='levelten_index'.\n"
+            "- These are LEVELIZED TOLLING AGREEMENT prices in $/kW-month (confirmed by methodology).\n"
+            "- Typical ISOs: AESO, CAISO, ERCOT, MISO, PJM, SPP (6 ISOs). ISO-NE and NYISO NOT covered by LevelTen Storage Index.\n"
+            "- Also extract 'Storage Duration Distribution by ISO' chart → percent for each duration (2h, 3h, 4h, 6h, 8h, 10h).\n\n"
+
+            "CRITICAL — Hub-level Solar P25 Extraction:\n"
+            "- Every ISO has a 'PPA Prices by Hub' section showing maps with Solar P25 values labeled on each hub.\n"
+            "- Extract every hub + price combination. Examples:\n"
+            "  - ERCOT: HB_NORTH, HB_WEST, HB_SOUTH, HB_HOUSTON (4 hubs)\n"
+            "  - CAISO: SP15 (1 hub)\n"
+            "  - MISO: MINN.HUB, ILLINOIS.HUB, INDIANA.HUB, LOUISIANA.HUB, ARKANSAS.HUB (5 hubs)\n"
+            "  - PJM: WESTERN HUB, DOM, AEP-DAYTON HUB, N ILLINOIS HUB (4 hubs)\n"
+            "  - SPP: SPPNORTH_HUB, SPPSOUTH_HUB (2 hubs)\n"
+            "  - AESO: Alberta (1 hub)\n\n"
+
+            "CRITICAL — Solar PSV (Projected Settlement Value):\n"
+            "- Report has 'Projected Settlement Values by Market: Solar' box plot chart.\n"
+            "- Read median, min, max for each ISO shown. Values are in $/MWh (can be NEGATIVE).\n"
+            "- Typical ISOs: AESO, CAISO, ERCOT, MISO, PJM, SPP.\n\n"
+
+            "CRITICAL — Pipeline Breakdown:\n"
+            "- Report has 'Technology Breakdown of Pipelines by COD Year' bar chart (in 'Going Hybrid' section).\n"
+            "- Extract MW values for each year × technology. Include Solar, Standalone Storage, Hybrid.\n"
+            "- DO NOT include Wind.\n\n"
 
             "General Rules:\n"
-            "- Solar prices: USD/MWh. Storage prices: USD/kW-month (levelized tolling).\n"
-            "- QoQ/YoY: percent change (e.g., 3.2 means +3.2%).\n"
-            "- Include ALL ISOs mentioned for Solar (typically 6-8 regions).\n"
-            "- key_insights: extract 3-5 most actionable data points for a Solar+BESS developer.\n"
-            "- DO NOT include any Wind data in the output.\n"
+            "- Solar prices: USD/MWh. Storage prices: USD/kW-month.\n"
+            "- If data not available for a field, use null. NEVER invent numbers.\n"
+            "- DO NOT include any Wind data anywhere in the output.\n"
             "- Return ONLY the JSON object. No explanation. No code fences."
         )
         body = {
@@ -632,7 +664,7 @@ async def upload_levelten(
         }
         try:
             res = requests.post("https://api.anthropic.com/v1/messages",
-                                headers=headers, json=body, timeout=90)
+                                headers=headers, json=body, timeout=150)
             if res.status_code != 200:
                 raise HTTPException(502, f"Claude API 오류: {res.text[:300]}")
             ai_text = res.json()["content"][0]["text"].strip()
@@ -643,6 +675,8 @@ async def upload_levelten(
             parsed = json.loads(ai_text.strip())
         except HTTPException:
             raise
+        except requests.Timeout:
+            raise HTTPException(504, "Claude API 응답 타임아웃 — 리포트가 너무 크거나 서버 혼잡 (재시도 권장)")
         except json.JSONDecodeError as e:
             raise HTTPException(500, f"AI 응답 JSON 파싱 실패: {str(e)}")
     else:
@@ -686,7 +720,7 @@ async def upload_levelten(
         }
         try:
             res = requests.post("https://api.anthropic.com/v1/messages",
-                                headers=headers, json=body, timeout=90)
+                                headers=headers, json=body, timeout=150)
             if res.status_code != 200:
                 raise HTTPException(502, f"Claude API 오류: {res.text[:300]}")
             ai_text = res.json()["content"][0]["text"].strip()
@@ -697,6 +731,8 @@ async def upload_levelten(
             parsed = json.loads(ai_text.strip())
         except HTTPException:
             raise
+        except requests.Timeout:
+            raise HTTPException(504, "Claude API 응답 타임아웃 — 리포트가 너무 크거나 서버 혼잡 (재시도 권장)")
         except json.JSONDecodeError as e:
             raise HTTPException(500, f"AI 응답 JSON 파싱 실패: {str(e)}")
 
@@ -723,8 +759,11 @@ async def upload_levelten(
             legacy.append({"tech":"solar", "region": s.get("region",""), "term_yr":10,
                            "p25": s.get("p25"), "p50": None, "p75": None})
         for s in parsed.get("storage_iso", []) or []:
+            # 새 스키마: min/p25/median/p75/max → legacy: p25/p50/p75
             legacy.append({"tech":"storage", "region": s.get("region",""), "term_yr":10,
-                           "p25": s.get("p25"), "p50": s.get("p50"), "p75": s.get("p75")})
+                           "p25": s.get("p25"),
+                           "p50": s.get("median") or s.get("p50"),
+                           "p75": s.get("p75")})
         parsed["entries"] = legacy
 
     # Firebase 저장: benchmark/levelten/{quarter}
@@ -827,50 +866,94 @@ def research_bess_tolling(user=Depends(get_current_user)):
 
     prompt = (
         f"You are an energy market research analyst specializing in US battery energy storage "
-        f"system (BESS) tolling agreements. Today: {today_str}.\n\n"
-        "TASK: Research CURRENT (2025-2026) BESS tolling prices across US ISOs. "
-        "BESS tolling = bilateral agreements where an offtaker pays a monthly capacity fee "
-        "(USD/kW-month, levelized) to use a storage asset. Prices vary by ISO and duration.\n\n"
-        "Use web_search to find recent data from:\n"
-        "- Industry research: Wood Mackenzie, BloombergNEF, S&P Global Market Intelligence, LevelTen, LCG Consulting\n"
-        "- Utility RFP results: EIA, FERC filings, state PUC decisions\n"
-        "- Press releases: NextEra, Invenergy, AES, EDP, Engie, Brookfield BESS deal announcements\n"
-        "- Market reports: ERCOT CDR, CAISO market reports, PJM capacity market auction results\n"
-        "- News: Utility Dive, Greentech Media, Energy Storage News, Reuters\n\n"
-        "Target ISOs: ERCOT, CAISO, PJM, MISO, SPP, ISO-NE\n"
-        "Target durations: 2h, 4h, 6h (most common)\n\n"
-        "For EACH ISO × duration combination, determine:\n"
-        "- P25 (low end of market, 25th percentile)\n"
-        "- P75 (high end of market, 75th percentile)\n"
-        "- At least 2 sources per ISO (URL + publication date)\n\n"
+        f"system (BESS) tolling agreements AND PPA markets. Today: {today_str}.\n\n"
+        "ROLE: This research is COMPLEMENTARY to LevelTen's official PPA Price Index.\n"
+        "LevelTen publishes official data for 6 ISOs: AESO, CAISO, ERCOT, MISO, PJM, SPP.\n"
+        "For these 6 ISOs the dashboard uses LevelTen first — your role is DURATION-level BESS detail only.\n\n"
+        "YOUR FOCUS (three objectives):\n"
+        "  (A) NON-LEVELTEN ISOs — provide BOTH BESS tolling AND PPA market commentary:\n"
+        "      - ISO-NE (New England)\n"
+        "      - NYISO (New York)\n"
+        "      - WECC_DSW (Desert Southwest: AZ, NM, NV — Arizona/New Mexico/Nevada utilities)\n"
+        "      - WECC_RM  (Rocky Mountain: UT, CO, WY, ID — PacifiCorp East/RMP, Xcel Colorado)\n"
+        "      - WECC_NW  (Northwest: OR, WA, MT — PacifiCorp West, PGE, Puget Sound Energy)\n"
+        "      - SERC (Southeast: TVA, Duke, Southern Company territory — NC, SC, GA, AL, TN, KY)\n"
+        "  (B) DURATION BREAKDOWN for LevelTen-covered ISOs (ERCOT, CAISO, PJM, MISO, SPP, AESO):\n"
+        "      → duration-level prices (2h / 4h / 6h) — LevelTen only gives ISO-level\n"
+        "  (C) For WECC sub-regions: include PPA market commentary since LevelTen has ZERO coverage.\n"
+        "      Key utility RFPs to reference: PacifiCorp IRP RFP, URC (Utah Renewable Communities),\n"
+        "      APS (Arizona Public Service), NV Energy, Xcel Energy Colorado, Portland General Electric,\n"
+        "      Idaho Power, Puget Sound Energy.\n\n"
+        "Research methodology — TRIANGULATION:\n"
+        "  1. Capacity market clearing prices (PJM, NYISO, ISO-NE) — adjusted for storage\n"
+        "  2. Merchant BESS revenue data (ERCOT ~$30-50/kW-yr, CAISO duck curve premium)\n"
+        "  3. Utility RFP announcements when prices are disclosed (PacifiCorp, APS, Xcel, etc.)\n"
+        "  4. Public company earnings calls (NextEra, Vistra, AES)\n"
+        "  5. Duration-adjustment heuristic:\n"
+        "     - 2h: 60-75% of 4h price (arbitrage-dominated)\n"
+        "     - 4h: reference (capacity-dominated, NERC/ISO standard)\n"
+        "     - 6h+: 110-130% of 4h (long-duration premium)\n"
+        "  6. Industry rule-of-thumb benchmarks (2025):\n"
+        "     - ERCOT 2h: $3-8/kW-mo  | 4h: $5-12/kW-mo\n"
+        "     - CAISO 4h: $10-16/kW-mo (duck curve) | 8h: $13-20/kW-mo\n"
+        "     - PJM 4h: $8-13/kW-mo (capacity market) | 2h: $5-9/kW-mo\n"
+        "     - SPP/MISO 4h: $6-11/kW-mo\n"
+        "     - ISO-NE 4h: $12-18/kW-mo (tight capacity, winter peak)\n"
+        "     - NYISO 4h: $11-17/kW-mo (DEC mandate, expensive zones J/K)\n"
+        "     - WECC_DSW 4h: $7-12/kW-mo (APS/NV Energy RFPs, solar-shifting demand)\n"
+        "     - WECC_RM 4h: $6-11/kW-mo (PacifiCorp/Xcel CO — emerging market, thin liquidity)\n"
+        "     - WECC_NW 4h: $6-10/kW-mo (hydro-dominant, moderate storage need)\n"
+        "     - SERC 4h: $7-12/kW-mo (vertically integrated utilities, bilateral)\n"
+        "Use these as STARTING POINTS, then VERIFY/ADJUST via web_search.\n\n"
+        "Use web_search to find CURRENT data from:\n"
+        "- Wood Mackenzie, BloombergNEF, S&P Global, LCG Consulting\n"
+        "- ISO capacity auction results: PJM BRA, ISO-NE FCA, NYISO ICAP\n"
+        "- State PUC filings for RFP results (Utah PSC, Colorado PUC, Oregon PUC, Arizona ACC)\n"
+        "- Utility IRP documents (PacifiCorp IRP, APS IRP, Xcel Colorado ERP)\n"
+        "- Press releases: NextEra, Invenergy, AES, EDP, Engie, Brookfield\n"
+        "- News: Utility Dive, Energy Storage News, Reuters, Canary Media\n\n"
+        "TARGET REGIONS (10 total):\n"
+        "- PRIMARY (no LevelTen coverage, full research required):\n"
+        "    ISO-NE, NYISO, WECC_DSW, WECC_RM, WECC_NW, SERC\n"
+        "- SECONDARY (LevelTen-covered, provide duration breakdown only):\n"
+        "    ERCOT, CAISO, PJM, MISO, SPP, AESO\n\n"
+        "TARGET DURATIONS for each region: 2h, 4h, 6h\n\n"
+        "Output: ALL text fields (market_note, methodology_note, caveats) MUST BE IN KOREAN.\n"
+        "Use formal nominal/concise style ('~확인됨', '~추정됨', '~범위').\n"
+        "For WECC_* regions, market_note MUST include PPA market commentary (utility RFP landscape, "
+        "recent clearing prices, Neptune-like Utah projects context).\n"
+        "Numbers stay numeric ($X/kW-mo). Region names stay English.\n\n"
         "Return ONLY this JSON structure (no markdown, no code fences):\n"
         "{\n"
         '  "research_date": "YYYY-MM-DD",\n'
         '  "iso_data": [\n'
         '    {\n'
-        '      "region": "ERCOT",\n'
+        '      "region": "ERCOT|CAISO|PJM|MISO|SPP|AESO|ISO-NE|NYISO|WECC_DSW|WECC_RM|WECC_NW|SERC",\n'
+        '      "levelten_covered": true,  // 6 LevelTen ISOs=true, 나머지 4 (ISO-NE/NYISO/WECC_*/SERC)=false\n'
         '      "durations": [\n'
         '        {"hours": 2, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"},\n'
         '        {"hours": 4, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"},\n'
         '        {"hours": 6, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"}\n'
         '      ],\n'
-        '      "market_note": "1-2 sentence ISO-specific context (e.g., capacity market dynamics)",\n'
+        '      "market_note": "(한국어) 시장 특성 1-2문장. WECC_*는 PPA 시장 commentary 포함 (주요 utility RFP, recent clearing prices, 인접 주 벤치마크)",\n'
         '      "sources": [\n'
-        '        {"url": "https://...", "title": "source title", "date": "YYYY-MM", "key_data": "exact quote/figure used"}\n'
+        '        {"url": "https://...", "title": "source title", "date": "YYYY-MM", "key_data": "핵심 수치/인용 (한국어 번역 OK)"}\n'
         '      ]\n'
         '    }\n'
         '  ],\n'
-        '  "methodology_note": "brief description of how estimates were synthesized",\n'
+        '  "methodology_note": "(한국어) 추정 방법 요약. LevelTen 공식 index와의 관계 명시: LevelTen은 6개 ISO만 커버, 본 리서치는 (1) 미커버 4개 지역(ISO-NE/NYISO/WECC_DSW/WECC_RM/WECC_NW/SERC) 보완, (2) 전체 duration별(2h/4h/6h) 세분화 목표. capacity market + merchant 수익 + utility RFP 삼각 검증",\n'
         '  "confidence_overall": "high|medium|low",\n'
-        '  "caveats": "1-2 sentence caveats about data quality or gaps"\n'
+        '  "caveats": "(한국어) 1-2문장. 예: 본 수치는 AI 리서치 기반 추정치. LevelTen 6개 ISO는 공식 데이터 우선. WECC sub-region 및 SERC는 공식 index 부재 — RFP/IRP 참고치"\n'
         "}\n\n"
         "Rules:\n"
         "- All prices in USD/kW-month, levelized over contract term.\n"
-        "- If no data found for a duration, omit it (don't fabricate).\n"
-        "- confidence: 'high' if 3+ sources agree, 'medium' if 2 sources, 'low' if 1 or inference only.\n"
-        "- If an ISO has no reliable recent data, omit that ISO entirely.\n"
-        "- Dates must be 2024-2026 (recent). Reject older data.\n"
-        "- If you cannot find reliable data despite web searching, return iso_data=[] and explain in caveats.\n"
+        "- ALWAYS include all 12 regions (10 + WECC split into 3 sub-regions):\n"
+        "  ERCOT, CAISO, PJM, MISO, SPP, AESO, ISO-NE, NYISO, WECC_DSW, WECC_RM, WECC_NW, SERC.\n"
+        "- Each region must have 3 durations (2h, 4h, 6h) — use benchmark if no evidence, mark confidence='low'.\n"
+        "- Confidence guide: 'high' if 3+ sources corroborate; 'medium' if 1-2 sources; 'low' if benchmark/inference only.\n"
+        "- For WECC_* regions, market_note MUST include PPA context (not just BESS) — target utilities and recent RFP clearing prices.\n"
+        "- Dates must be 2024-2026 (recent only).\n"
+        "- All text fields in Korean formal nominal style.\n"
         "- Return valid JSON only."
     )
 
@@ -1156,6 +1239,146 @@ def calculate_valuation(req: ValuationCalcRequest, user=Depends(get_current_user
         return {"ok": True, "project_id": req.project_id, "result": result}
     except Exception as e:
         raise HTTPException(500, f"Calculation error: {str(e)}")
+
+
+# ── Break-Even Analysis (Newton-Raphson) ─────────
+class BreakEvenRequest(BaseModel):
+    project_id: str = ""
+    inputs: dict
+    target_irr_pct: float  # e.g., 11.0 for 11%
+    target_var: str = "ppa_price"  # 현재는 PPA만 지원 (확장 가능)
+
+@app.post("/valuation/breakeven")
+def break_even(req: BreakEvenRequest, user=Depends(get_current_user)):
+    """
+    Newton-Raphson 기반 정확한 PPA 역산.
+    Phase 1: PPA ±25% 11점 민감도 스캔
+    Phase 2: Newton-Raphson (tolerance 0.01% IRR)
+    """
+    try:
+        base_inputs = dict(req.inputs)
+        base_ppa = float(base_inputs.get("ppa_price", 68.82))
+        target_irr = req.target_irr_pct / 100.0  # 0.11
+        tol = 0.0001  # 0.01% IRR tolerance
+        h = 0.50  # finite difference step $/MWh
+        max_iter = 10
+
+        def calc_irr(ppa_val):
+            """Calc engine을 호출해 Sponsor IRR 반환"""
+            inp = dict(base_inputs)
+            inp["ppa_price"] = ppa_val
+            res = _calc_engine(inp)
+            return res.get("sponsor_irr_contract") or res.get("sponsor_irr") or 0.0
+
+        # ── Phase 1: ±25% 민감도 스캔 ──
+        pcts = [-25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25]
+        sensitivity = []
+        for pct in pcts:
+            ppa_p = base_ppa * (1 + pct / 100.0)
+            irr_p = calc_irr(ppa_p)
+            sensitivity.append({
+                "pct": pct,
+                "ppa": round(ppa_p, 2),
+                "irr_pct": round(irr_p * 100, 4)
+            })
+
+        # ── Phase 2: Newton-Raphson ──
+        iterations = []
+        ppa = base_ppa  # 초기값
+        status = "not_started"
+        solution = None
+
+        # 가능 여부 체크: ±25% 범위에 Target이 있는지
+        min_irr = sensitivity[0]["irr_pct"]
+        max_irr = sensitivity[-1]["irr_pct"]
+        target_irr_pct = target_irr * 100
+
+        if target_irr_pct < min_irr or target_irr_pct > max_irr:
+            # 범위 밖: 가장 가까운 끝 PPA로 시작 (그래도 시도)
+            if target_irr_pct < min_irr:
+                ppa = base_ppa * 0.75
+                status = "target_below_range"
+            else:
+                ppa = base_ppa * 1.25
+                status = "target_above_range"
+
+        for i in range(max_iter):
+            irr_cur = calc_irr(ppa)
+            err = irr_cur - target_irr
+            iterations.append({
+                "iter": i,
+                "ppa": round(ppa, 4),
+                "irr_pct": round(irr_cur * 100, 4),
+                "error_pct": round(err * 100, 4),
+                "status": "converged" if abs(err) < tol else "iterating"
+            })
+
+            if abs(err) < tol:
+                solution = {
+                    "ppa": round(ppa, 4),
+                    "irr_pct": round(irr_cur * 100, 4),
+                    "error_pct": round(err * 100, 4),
+                    "iterations": i + 1,
+                    "converged": True
+                }
+                status = "converged"
+                break
+
+            # 미분 (central difference)
+            irr_plus = calc_irr(ppa + h)
+            irr_minus = calc_irr(ppa - h)
+            derivative = (irr_plus - irr_minus) / (2 * h)
+
+            if abs(derivative) < 1e-8:
+                status = "flat_derivative"
+                break
+
+            # Newton step + 안전장치 (최대 20% 한 스텝)
+            delta = -err / derivative
+            max_step = base_ppa * 0.20
+            if abs(delta) > max_step:
+                delta = max_step if delta > 0 else -max_step
+            ppa = ppa + delta
+
+            # 음수/비정상 방지
+            if ppa < 1.0:
+                ppa = 1.0
+            elif ppa > base_ppa * 3:
+                ppa = base_ppa * 3
+
+        if not solution:
+            # 수렴 실패 - 마지막 iteration 값 사용
+            last = iterations[-1] if iterations else {"ppa": base_ppa, "irr_pct": 0}
+            solution = {
+                "ppa": last["ppa"],
+                "irr_pct": last["irr_pct"],
+                "error_pct": last.get("error_pct", 0),
+                "iterations": len(iterations),
+                "converged": False
+            }
+            if status == "not_started":
+                status = "max_iter_reached"
+
+        # 추가 meta: Dev Margin 고정값 (참고용)
+        base_res = _calc_engine(base_inputs)
+        dev_margin_k = base_res.get("dev_margin", 0)  # $k
+
+        return {
+            "ok": True,
+            "base_ppa": round(base_ppa, 2),
+            "target_irr_pct": round(target_irr_pct, 2),
+            "sensitivity": sensitivity,
+            "iterations": iterations,
+            "solution": solution,
+            "status": status,
+            "dev_margin_k": round(dev_margin_k, 0),
+            "tolerance_pct": tol * 100,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Break-even calculation error: {str(e)}")
 
 
 @app.get("/valuation/calculate/defaults")
@@ -1982,13 +2205,14 @@ p {{ margin: 4pt 0; color: #1F2937; }}
 .metrics-grid {{
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  gap: 6pt;
+  gap: 4pt;
   margin-bottom: 14pt;
 }}
 .metric-card {{
-  padding: 8pt 10pt;
+  padding: 7pt 8pt;
   border: 0.5pt solid #D1D5DB;
   border-radius: 2pt;
+  overflow: hidden;
 }}
 .metric-card-primary {{
   border-left: 2.5pt solid #059669;
@@ -2000,24 +2224,29 @@ p {{ margin: 4pt 0; color: #1F2937; }}
   border-left: 2.5pt solid #2563EB;
 }}
 .metric-label {{
-  font-size: 7pt;
+  font-size: 6.5pt;
   font-weight: 700;
   color: #6B7280;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
-  margin-bottom: 3pt;
+  margin-bottom: 2pt;
+  white-space: nowrap;
 }}
 .metric-value {{
-  font-size: 15pt;
+  font-size: 14pt;
   font-weight: 700;
   color: #111827;
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
+  white-space: nowrap;
 }}
 .metric-sub {{
-  font-size: 7pt;
+  font-size: 6.5pt;
   color: #6B7280;
   margin-top: 2pt;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }}
 
 /* Financial table */
@@ -2313,27 +2542,27 @@ p {{ margin: 4pt 0; color: #1F2937; }}
     <div class="metric-card metric-card-primary">
       <div class="metric-label">Sponsor IRR</div>
       <div class="metric-value">{irr_lev_pre}</div>
-      <div class="metric-sub">Levered · Pre-Tax</div>
+      <div class="metric-sub">Lev · Pre-Tax</div>
     </div>
     <div class="metric-card">
       <div class="metric-label">Sponsor IRR</div>
       <div class="metric-value">{irr_at_before}</div>
-      <div class="metric-sub">After-Tax (Before NOL)</div>
+      <div class="metric-sub">A-Tax · Pre-NOL</div>
     </div>
     <div class="metric-card metric-card-secondary">
       <div class="metric-label">Sponsor IRR</div>
       <div class="metric-value">{irr_at_after}</div>
-      <div class="metric-sub">After-Tax (After NOL)</div>
+      <div class="metric-sub">A-Tax · Post-NOL</div>
     </div>
     <div class="metric-card">
       <div class="metric-label">Project IRR</div>
       <div class="metric-value">{irr_unlev}</div>
-      <div class="metric-sub">Unlevered · Pre-Tax</div>
+      <div class="metric-sub">Unlev · Pre-Tax</div>
     </div>
     <div class="metric-card metric-card-wacc">
       <div class="metric-label">WACC</div>
       <div class="metric-value">{wacc_val}</div>
-      <div class="metric-sub">Capital Cost · Hurdle</div>
+      <div class="metric-sub">Capital Cost</div>
     </div>
   </div>
 
@@ -2522,25 +2751,61 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         market_context = payload.get("market_context", {}) or {}
         rates_txt = market_context.get("rates_summary", "")
         levelten_txt = market_context.get("levelten_summary", "")
-        bess_tolling_txt = market_context.get("bess_tolling_summary", "")
+        # BESS 소스 priority: LevelTen Storage (official) 1순위, AI Research (fallback) 2순위
+        levelten_storage_txt = market_context.get("levelten_storage_summary", "")  # 공식 ISO-level
+        bess_tolling_txt = market_context.get("bess_tolling_summary", "")          # AI Research duration별
         our_bess_duration = market_context.get("our_bess_duration", 4)
+        # LevelTen 커버 여부 + 지역 해석 (WECC sub-region, SERC 등)
+        lt_covered = market_context.get("levelten_covered", True)  # 기본 True (기존 프로젝트 호환)
+        region_display = market_context.get("region_display", "")  # "WECC Rocky Mountain (UT)" 등
+        sub_region = market_context.get("sub_region", "")          # WECC_RM, WECC_DSW, etc.
+        continental_avg_txt = market_context.get("continental_avg_summary", "")  # Market-Averaged Continental (대용 비교용)
 
         market_block = ""
-        if rates_txt or levelten_txt or bess_tolling_txt:
+        if rates_txt or levelten_txt or levelten_storage_txt or bess_tolling_txt or continental_avg_txt:
             market_block = "=== CURRENT MARKET DATA (most recent; use this INSTEAD of training knowledge) ===\n"
             if rates_txt:
                 market_block += f"  Interest Rates: {rates_txt}\n"
+            # 지역 해석 명시
+            if region_display:
+                market_block += f"  Project Region: {region_display}"
+                if lt_covered:
+                    market_block += " [LevelTen 직접 커버 ISO]\n"
+                else:
+                    market_block += f" [LevelTen 미커버 — 대용 비교 필요]\n"
             if levelten_txt:
-                market_block += f"  LevelTen PPA Benchmark: {levelten_txt}\n"
-                market_block += "  → If 'Our ISO' Solar P25 data is provided above, USE IT to compare against project PPA.\n"
-                market_block += "    Reference specifically: 'PPA $X.XX vs LevelTen P25 $Y.YY in {ISO}' for concrete risk commentary.\n"
+                market_block += f"  LevelTen PPA Benchmark (Solar): {levelten_txt}\n"
+                if lt_covered:
+                    market_block += "  → Our ISO가 LevelTen에 있음. USE IT to compare against project PPA directly.\n"
+                    market_block += "    Reference: 'PPA $X.XX vs LevelTen P25 $Y.YY in {ISO}'.\n"
+                else:
+                    market_block += "  → Our region is NOT in LevelTen. Use as market context reference only.\n"
+            # 대용 비교 (WECC/SERC 등 LevelTen 미커버 지역)
+            if not lt_covered and continental_avg_txt:
+                market_block += f"  Market-Averaged Continental Index (대용 비교용): {continental_avg_txt}\n"
+                market_block += f"  → Use this as PRIMARY benchmark since {sub_region or 'project region'} has NO direct LevelTen coverage.\n"
+                market_block += "  → Cite as 'LevelTen Market-Averaged Continental (전 대륙 ISO 평균, 대용치)'.\n"
+                market_block += "  → Explicitly note '해당 지역 공식 P25 데이터 없음 → 대륙 평균 대비 비교' in risk commentary.\n"
+            # Priority 1: LevelTen Storage (official, ISO-level)
+            if levelten_storage_txt:
+                market_block += f"  LevelTen Storage Index (OFFICIAL tolling offers, Q4 2025): {levelten_storage_txt}\n"
+                market_block += f"  → Project BESS duration: {our_bess_duration}h (ISO-level price applies broadly, consider duration fit)\n"
+                market_block += "  → USE THIS OFFICIAL DATA as primary BESS benchmark. Cite as 'LevelTen 공식 Storage Index'.\n"
+                market_block += "  → If project toll EXCEEDS ISO P75 → risk 'BESS Toll 시장 상단 초과' (severity: Critical if >20% over, Watch if slight).\n"
+                market_block += "  → If project toll is BELOW ISO P25 → positive flag '보수적 산정'.\n"
+            # Priority 2: AI Research (fallback for non-LevelTen ISOs: ISO-NE/NYISO/WECC_*/SERC, or duration-level detail)
             if bess_tolling_txt:
-                market_block += f"  BESS Tolling Market (AI Research, NOT official index): {bess_tolling_txt}\n"
-                market_block += f"  → Project BESS duration: {our_bess_duration}h\n"
-                market_block += "  → USE THIS DATA to benchmark the project's BESS toll rate against market P25-P75 range.\n"
-                market_block += "  → If project toll EXCEEDS market P75 → AUTO-ADD risk 'BESS Toll 시장 상단 초과' (severity: Critical if >20% over, Watch if slight).\n"
-                market_block += "  → If project toll is BELOW market P25 → note 'BESS 수익성 보수적 산정' (positive flag).\n"
-                market_block += "  → Since this is AI-researched (not official LevelTen), ALWAYS caveat: '시장 추정치 기준' / 'AI research-based, not official index'.\n"
+                if levelten_storage_txt:
+                    market_block += f"  AI Research Duration Detail (supplementary — LevelTen only provides ISO-level): {bess_tolling_txt}\n"
+                    market_block += f"  → Use ONLY to add duration-specific nuance ({our_bess_duration}h). LevelTen ISO-level is primary.\n"
+                    market_block += "  → Caveat: 'duration 세부는 AI 추정치'.\n"
+                else:
+                    # LevelTen 없는 지역 (WECC_*, ISO-NE, NYISO, SERC)
+                    market_block += f"  BESS Tolling Estimate (AI Research — {sub_region or 'non-LevelTen region'}): {bess_tolling_txt}\n"
+                    market_block += f"  → Project BESS duration: {our_bess_duration}h\n"
+                    market_block += "  → CAVEAT: '시장 추정치, 공식 index 아님' when citing.\n"
+                    if sub_region and sub_region.startswith("WECC"):
+                        market_block += f"  → For {sub_region}: reference relevant utility RFPs (PacifiCorp IRP, URC, APS, Xcel Colorado, etc.) if AI Research provided commentary.\n"
             market_block += "\n"
 
         # 경제성 지표 추출 (Unlevered vs WACC 비교용)
@@ -2648,6 +2913,13 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
            "  ✗ '~하도록 한다' (→ '~권고')\n"
            "  ✗ '~해야 합니다' / '~할 수 있습니다' (too formal/verbose)\n"
            "Maintain consistency — ALL sentences end in the nominal/concise style.\n"
+           "\n"
+           "CRITICAL — INDUSTRY TERMINOLOGY:\n"
+           "  ✗ '증설' (WRONG — means 'capacity expansion')\n"
+           "  ✓ 'Augmentation' (English preferred, industry standard)\n"
+           "  ✓ '배터리 교체 (용량 유지)' or '배터리 보강 (성능 유지)' (if Korean needed)\n"
+           "  Augmentation = replacing/adding cells to MAINTAIN capacity over degradation,\n"
+           "  NOT adding new capacity. Never call it '증설'.\n"
            "\n"
            "Only 'verdict' (PROCEED/RECUT/STOP) and 'verdict_color' (green/amber/red) stay English.\n"
            "Financial numbers with units can stay English-style (e.g., '10.38%', '$68.82/MWh').\n"
