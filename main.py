@@ -1056,67 +1056,111 @@ import numpy_financial as npf
 
 def _calc_engine(inputs: dict) -> dict:
     pv_mwac   = inputs.get('pv_mwac', 199)
-    pv_mwdc   = pv_mwac * inputs.get('dc_ac_ratio', 1.34)
+    pv_mwdc   = inputs.get('pv_mwdc') or pv_mwac * inputs.get('dc_ac_ratio', 1.34)
     bess_mw   = inputs.get('bess_mw', 199)
     bess_mwh  = inputs.get('bess_mwh', 796)
     life      = int(inputs.get('life', 35))
 
-    # CAPEX
-    module_cwp   = inputs.get('module_cwp', 31.5)
-    bos_cwp      = inputs.get('bos_cwp', 42.9)
-    ess_per_kwh  = inputs.get('ess_per_kwh', 234.5)
-    epc_cont_pct = inputs.get('epc_cont_pct', 8.0)
-    owner_pct    = inputs.get('owner_pct', 3.0)
+    # CAPEX 구성 ───────────────────────────────────────────────
+    module_cwp   = inputs.get('module_cwp', 31.5)        # c/Wdc
+    pv_bos_cwp   = inputs.get('bos_cwp', 42.88)          # c/Wdc (PV BOS+Construction)
+    ess_per_kwh  = inputs.get('ess_per_kwh', 234.5)      # $/kWh (BESS Equipment)
+    bess_bos_per_kwh = inputs.get('bess_bos_per_kwh', 130.0)  # $/kWh (BESS BOS — NEW)
+    epc_cont_pct = inputs.get('epc_cont_pct', 8.0)       # %
+    owner_pct    = inputs.get('owner_pct', 3.0)          # %
     softcost_pct = inputs.get('softcost_pct', 5.0)
-    intercon_m   = inputs.get('intercon_m', 120.0)
-    dev_cost_m   = inputs.get('dev_cost_m', 20.0)
+    intercon_m   = inputs.get('intercon_m', 22.5)        # $M (Sub+Gentie+GSU+Trans avg Neptune)
+    dev_cost_m   = inputs.get('dev_cost_m', 20.0)        # $M
     capex_etc    = inputs.get('capex_etc', 0)
 
-    pv_module = pv_mwdc*1000*module_cwp/100
-    pv_bos    = pv_mwdc*1000*bos_cwp/100
-    ess_equip = bess_mwh*ess_per_kwh
-    epc_base  = pv_module + pv_bos + ess_equip
-    epc_total = epc_base * (1 + epc_cont_pct/100)
-    pre_capex = (epc_total*(1+owner_pct/100+softcost_pct/100)
-                 + intercon_m*1000 + dev_cost_m*1000 + capex_etc*1000)
-    int_rate   = inputs.get('int_rate', 5.5) / 100
-    debt_ratio = inputs.get('debt_ratio', 47.6) / 100
-    base_capex = pre_capex * (1 + debt_ratio*int_rate*0.75 + 0.012)
-    total_capex = float(inputs['capex_total_override'])*1000 if inputs.get('capex_total_override') else base_capex
+    # 하드웨어/BOS 비용
+    pv_module    = pv_mwdc*1000*module_cwp/100           # $K
+    pv_bos       = pv_mwdc*1000*pv_bos_cwp/100           # $K
+    ess_equip    = bess_mwh*ess_per_kwh                  # $K
+    bess_bos     = bess_mwh*bess_bos_per_kwh             # $K (NEW)
+    epc_base     = pv_module + pv_bos + ess_equip + bess_bos
+    epc_total    = epc_base * (1 + epc_cont_pct/100)
+    pre_capex    = (epc_total*(1+owner_pct/100+softcost_pct/100)
+                    + intercon_m*1000 + dev_cost_m*1000 + capex_etc*1000)
+    int_rate     = inputs.get('int_rate', 5.5) / 100
+    debt_ratio   = inputs.get('debt_ratio', 47.6) / 100
+    base_capex   = pre_capex * (1 + debt_ratio*int_rate*0.75 + 0.012)
+    total_capex  = float(inputs['capex_total_override'])*1000 if inputs.get('capex_total_override') else base_capex
 
-    dev_margin  = pv_mwac*1000*inputs.get('dev_margin_kwac', 200)/1000
-    epc_margin  = epc_base * inputs.get('epc_margin_pct', 7.95)/100
+    dev_margin   = pv_mwac*1000*inputs.get('dev_margin_kwac', 200)/1000
+    epc_margin   = epc_base * inputs.get('epc_margin_pct', 7.95)/100
     total_margin = dev_margin + epc_margin
 
     loan_term  = int(inputs.get('loan_term', 18))
     debt       = total_capex * debt_ratio
     ann_ds     = float(npf.pmt(int_rate, loan_term, -debt)) if debt > 0 else 0
 
+    # Credit System ─────────────────────────────────────────────
+    # Mode: ITC (capital credit) vs PTC (production credit)
+    # ITC는 PV와 BESS를 분리해서 적용 가능 (Neptune: PV 0%, BESS 30%)
+    # PTC는 PV generation에만 적용 (BESS는 ITC만 가능)
+    credit_mode  = inputs.get('credit_mode', 'ITC').upper()  # 'ITC' or 'PTC'
+    itc_elig     = inputs.get('itc_elig', 97) / 100
+
+    # PV/BESS ITC 분리 (inputs 없으면 레거시 단일 credit_val 사용)
+    pv_itc_rate  = inputs.get('pv_itc_rate')
+    bess_itc_rate = inputs.get('bess_itc_rate')
+    if pv_itc_rate is None and bess_itc_rate is None:
+        # 레거시: credit_val을 전체에 적용
+        legacy = inputs.get('itc_rate') or inputs.get('credit_val', 30)
+        pv_itc_rate  = legacy
+        bess_itc_rate = legacy
+    pv_itc_rate  = (pv_itc_rate or 0) / 100
+    bess_itc_rate = (bess_itc_rate or 0) / 100
+
+    # PTC Rate ($/kWh) — production-based
+    ptc_rate_per_kwh = inputs.get('ptc_rate_per_kwh') or inputs.get('credit_val')
+    if credit_mode == 'PTC':
+        # credit_val이 30 같이 크면 잘못 입력된 것 — 0.03으로 자동 보정
+        if ptc_rate_per_kwh and ptc_rate_per_kwh > 1:
+            ptc_rate_per_kwh = ptc_rate_per_kwh / 100.0
+    ptc_rate_per_kwh = ptc_rate_per_kwh or 0.0
+
+    # PV CAPEX과 BESS CAPEX 분리 (ITC basis용)
+    pv_capex_share   = (pv_module + pv_bos) / epc_base if epc_base > 0 else 0.5
+    bess_capex_share = (ess_equip + bess_bos) / epc_base if epc_base > 0 else 0.5
+
+    if credit_mode == 'ITC':
+        # 가중 평균 ITC rate (CAPEX 비중 기준)
+        effective_itc_rate = pv_itc_rate * pv_capex_share + bess_itc_rate * bess_capex_share
+    else:
+        # PTC 모드: ITC 적용 안 함 (BESS도 ITC 받을 수 있지만 단순화 위해 일단 미적용)
+        # BESS ITC는 PTC와 병행 가능하므로 bess_itc_rate 살아있으면 그대로
+        effective_itc_rate = bess_itc_rate * bess_capex_share  # BESS만 ITC
+
     # TE Flip
     _fy_raw = inputs.get('flip_yield', 8.75)
-    if _fy_raw > 50: _fy_raw = _fy_raw / 100   # 875 → 8.75 자동 보정
+    if _fy_raw > 50: _fy_raw = _fy_raw / 100
     flip_yield = _fy_raw / 100
     flip_term  = int(inputs.get('flip_term', 7))
-    itc_elig   = inputs.get('itc_elig', 97) / 100
-    itc_rate   = inputs.get('itc_rate') or inputs.get('credit_val', 30)
-    itc_rate   = itc_rate / 100
     te_mult    = inputs.get('te_mult', 1.115)
     yield_adj  = 1 / (1 + (flip_yield - 0.0875) * 8)
 
     # ── TE Invest 산정 + Sponsor Equity 최소선 확보 ──────────────────
-    # 1) 이론치: ITC 기반 TE 투자 규모
-    te_theoretical = total_capex * itc_elig * itc_rate * te_mult * yield_adj
+    te_theoretical = total_capex * itc_elig * effective_itc_rate * te_mult * yield_adj
 
-    # 2) 구조적 상한: Debt + TE + Sponsor Eq = CAPEX, Sponsor Eq는 최소 10% CAPEX 확보
-    #    (Sponsor Eq <5% 되면 IRR 계산 왜곡 — Sponsor 기여도가 미미해서 IRR 발산)
-    min_sponsor_eq_pct = inputs.get('min_sponsor_eq_pct', 10.0) / 100  # 기본 10% of CAPEX
+    min_sponsor_eq_pct = inputs.get('min_sponsor_eq_pct', 10.0) / 100
     max_te_invest = total_capex - debt - total_capex * min_sponsor_eq_pct
 
-    # 3) 실제 TE 투자: 이론치와 구조적 상한 중 작은 값
     te_invest = max(0, min(te_theoretical, max_te_invest))
+
+    # Capital Stack Override: te_ratio / sponsor_eq_ratio 명시하면 해당 비율 사용
+    # (예: Neptune은 Debt 47.6%, TE 32.5%, Eq 19.8% — ITC 기반 공식으로 못 맞춤)
+    te_ratio_override = inputs.get('te_ratio_override')
+    if te_ratio_override is not None:
+        te_invest = total_capex * te_ratio_override / 100
+        te_invest = max(0, min(te_invest, max_te_invest))
 
     sponsor_eq = total_capex - debt - te_invest
     effective_eq = sponsor_eq * (1 - int_rate * 0.75)
+
+    # 레거시 호환
+    itc_rate = effective_itc_rate
 
     # MACRS depreciation
     tax_rate    = inputs.get('tax_rate', 21) / 100
@@ -1210,6 +1254,14 @@ def _calc_engine(inputs: dict) -> dict:
         depr = depr_sched.get(yr, 0)
         s_tax = depr * tax_rate * depr_share  # sponsor keeps depr_share of tax benefit
 
+        # PTC (Production Tax Credit) — PV만, COD 후 10년간
+        # Sponsor에게 depr_share 비율로 귀속 (TE가 flip까지 대부분 가져감)
+        ptc_benefit = 0
+        if credit_mode == 'PTC' and yr <= 10:
+            ptc_benefit = prod * ptc_rate_per_kwh * 1000 / 1000  # MWh → kWh → $ → $K
+            # 간단화: Sponsor depr_share 비율 배분
+            s_tax += ptc_benefit * depr_share
+
         op_cf = ebitda - ds - aug_c
         if yr<=flip_term:
             s_cf = op_cf*(1-pre_flip_cash_te) + s_tax
@@ -1221,7 +1273,7 @@ def _calc_engine(inputs: dict) -> dict:
         if yr<=10:
             detail.append({'yr':yr,'rev':round(total_rev,0),'opex':round(opex,0),
                 'ebitda':round(ebitda,0),'ds':round(ds,0),'aug':round(aug_c,0),
-                'depr':round(depr,0),'s_cf':round(s_cf,0)})
+                'depr':round(depr,0),'s_cf':round(s_cf,0),'ptc':round(ptc_benefit,0)})
 
     lirr = _irr_robust(pretax_cfs, guess=0.10)   # Sponsor pretax levered (Neptune Row 26 ~10%)
     uirr = _irr_robust(unlev_cfs, guess=0.05)    # Asset-level unlevered (Neptune Row 27 ~8%)
@@ -1256,6 +1308,10 @@ def _calc_engine(inputs: dict) -> dict:
     return {
         'capex_total':   round(total_capex,0),
         'epc_base':      round(epc_base,0),
+        'pv_module':     round(pv_module,0),
+        'pv_bos':        round(pv_bos,0),
+        'bess_equip':    round(ess_equip,0),
+        'bess_bos':      round(bess_bos,0),
         'debt':          round(debt,0),
         'equity':        round(sponsor_eq+te_invest,0),
         'te_invest':     round(te_invest,0),
@@ -1273,6 +1329,11 @@ def _calc_engine(inputs: dict) -> dict:
         'hurdle_sponsor_irr_used': round(hurdle_sponsor,6),
         'ebitda_yield':  round(ebitda_yield,2),
         'aug_cost_ea':   round(aug_cost_ea,0),
+        'life_yrs':      life,
+        'credit_mode':   credit_mode,
+        'pv_itc_rate':   round(pv_itc_rate*100, 2),
+        'bess_itc_rate': round(bess_itc_rate*100, 2),
+        'ptc_rate':      round(ptc_rate_per_kwh, 4),
         'annual_detail': detail,
         'cashflows':     [round(x,0) for x in cashflows[:36]],
     }
@@ -1432,12 +1493,14 @@ def break_even(req: BreakEvenRequest, user=Depends(get_current_user)):
 def get_calc_defaults(user=Depends(get_current_user)):
     """Return default input values for the calculator"""
     return {
-        "pv_mwac": 199, "dc_ac_ratio": 1.34,
+        "pv_mwac": 199, "dc_ac_ratio": 1.348,
+        "pv_mwdc": 268.3,
         "bess_mw": 199, "bess_mwh": 796,
         "cf_pct": 21.24, "life": 35,
-        "module_cwp": 31.5, "bos_cwp": 42.9, "ess_per_kwh": 234.5,
+        "module_cwp": 31.5, "bos_cwp": 42.88,
+        "ess_per_kwh": 234.5, "bess_bos_per_kwh": 130.0,
         "epc_cont_pct": 8.0, "owner_pct": 3.0, "softcost_pct": 5.0,
-        "intercon_m": 120.0, "dev_cost_m": 20.0,
+        "intercon_m": 22.5, "dev_cost_m": 20.0,
         "dev_margin_kwac": 200, "epc_margin_pct": 7.95,
         "ppa_price": 68.82, "ppa_term": 25, "ppa_esc": 0,
         "bess_toll": 13.68, "bess_toll_term": 20, "merchant_ppa": 45.0,
@@ -1448,6 +1511,14 @@ def get_calc_defaults(user=Depends(get_current_user)):
         "aug_price": 150, "aug_mwh_pct": 18.8, "aug_y1": 4, "aug_y2": 8, "aug_y3": 12,
         "debt_ratio": 47.6, "int_rate": 5.5, "loan_term": 18,
         "te_pct": 0,
+        # Credit System — Neptune 기준
+        "credit_mode": "ITC",
+        "pv_itc_rate": 0,     # Neptune PV ITC 0%
+        "bess_itc_rate": 30,  # Neptune BESS ITC 30%
+        "ptc_rate_per_kwh": 0.027,  # PTC 모드 시 IRA 기본값
+        # Capital Stack Override (Neptune FMV 기준)
+        "capex_total_override": 836.7,
+        "te_ratio_override": 32.52,
     }
 
 # ══════════════════════════════════════════════════
