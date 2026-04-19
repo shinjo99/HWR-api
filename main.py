@@ -2120,6 +2120,9 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
             'conv_err_t': 'xlsb → xlsx 변환 에러',
             'conv_err_d': '변환 오류: ',
             'conv_err_a': 'xlsx로 재저장 후 업로드',
+            'formula_skip_t': '수식 스트링 분석 스킵 (xlsb 직접 분석)',
+            'formula_skip_d': '서버에 LibreOffice가 없어 xlsb → xlsx 변환을 건너뛰었습니다. 수식 텍스트 분석은 스킵하며, 셀 결과값(#REF!/#VALUE! 등)과 나머지 정합성 체크는 xlsb에서 직접 수행합니다.',
+            'formula_skip_a': '수식 정밀 분석이 필요하면 xlsx로 저장 후 재업로드',
             'formula_t': '심각한 수식 에러 {n}개',
             'formula_d': '#NAME?/#REF!/#DIV/0 등 에러. 샘플: ',
             'formula_a': '원본 모델러에게 해당 셀 재확인 요청. Named Range 깨짐 or 외부 참조 오류 추정.',
@@ -2201,6 +2204,9 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
             'conv_err_t': 'xlsb → xlsx conversion error',
             'conv_err_d': 'Conversion error: ',
             'conv_err_a': 'Re-save as xlsx and re-upload',
+            'formula_skip_t': 'Formula-text analysis skipped (xlsb analyzed directly)',
+            'formula_skip_d': 'Server lacks LibreOffice; xlsb → xlsx conversion skipped. Formula-string analysis is bypassed, but cell-value errors (#REF!/#VALUE! etc.) and all other integrity checks are performed directly on xlsb.',
+            'formula_skip_a': 'Re-save as xlsx and re-upload if detailed formula analysis needed',
             'formula_t': '{n} serious formula errors',
             'formula_d': '#NAME?/#REF!/#DIV/0 errors. Samples: ',
             'formula_a': 'Ask the original modeler to verify cells. Likely broken Named Range or external reference errors.',
@@ -2277,112 +2283,155 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
     metadata = {}
     
     # xlsb인 경우 xlsx로 변환 (openpyxl로 수식 읽기 위해)
+    # libreoffice 미설치 환경(Railway 등)에서는 변환 실패 시
+    # 수식 체크만 스킵하고 나머지 (Capital Stack / IRR / Debt / Revenue)는 pyxlsb로 진행
     xlsx_path = filepath
     if filepath.endswith('.xlsb'):
         try:
             subprocess.run(['libreoffice', '--headless', '--convert-to', 'xlsx',
                           '--outdir', os.path.dirname(filepath), filepath],
                          check=True, capture_output=True, timeout=60)
-            xlsx_path = filepath.replace('.xlsb', '.xlsx')
-            if not os.path.exists(xlsx_path):
+            candidate = filepath.replace('.xlsb', '.xlsx')
+            if os.path.exists(candidate):
+                xlsx_path = candidate
+            else:
+                xlsx_path = None
+                checks.append({
+                    'category': t['cat_formula'], 'severity': 'INFO',
+                    'code': 'FORMULA_SKIP',
+                    'title': t['formula_skip_t'],
+                    'description': t['formula_skip_d'],
+                    'action': t['formula_skip_a']
+                })
+        except Exception as e:
+            xlsx_path = None
+            checks.append({
+                'category': t['cat_formula'], 'severity': 'INFO',
+                'code': 'FORMULA_SKIP',
+                'title': t['formula_skip_t'],
+                'description': t['formula_skip_d'],
+                'action': t['formula_skip_a']
+            })
+    
+    # ═══ 1. 수식 오류 체크 (xlsx_path 있을 때만) ═══
+    if xlsx_path and xlsx_path != filepath:
+        try:
+            wb = load_workbook(xlsx_path, data_only=False)
+            sheet_names = wb.sheetnames
+            metadata['sheets'] = sheet_names
+            metadata['sheet_count'] = len(sheet_names)
+            
+            formula_errors = []    # 심각한 수식 에러
+            na_errors = []
+            external_refs = []
+            
+            for sheet_name in sheet_names:
+                ws = wb[sheet_name]
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if cell.value is None:
+                            continue
+                        val_str = str(cell.value)
+                        for err in ['#NAME?', '#REF!', '#DIV/0!', '#VALUE!', '#NULL!']:
+                            if err in val_str:
+                                formula_errors.append({
+                                    'sheet': sheet_name,
+                                    'cell': cell.coordinate,
+                                    'error': err,
+                                    'formula': val_str[:100],
+                                })
+                                break
+                        if '#N/A' in val_str:
+                            na_errors.append({'sheet': sheet_name, 'cell': cell.coordinate})
+                        if '[' in val_str and ('\\' in val_str or '.xls' in val_str):
+                            if not any(e in val_str for e in ['#NAME?', '#REF!']):
+                                external_refs.append({
+                                    'sheet': sheet_name,
+                                    'cell': cell.coordinate,
+                                    'ref': val_str[:150],
+                                })
+            
+            if formula_errors:
+                sample = formula_errors[:5]
+                sample_text = '; '.join([f"{e['sheet']}!{e['cell']}({e['error']})" for e in sample])
                 checks.append({
                     'category': t['cat_formula'], 'severity': 'HIGH',
-                    'code': 'CONV_FAIL', 'title': t['conv_fail_t'],
-                    'description': t['conv_fail_d'],
-                    'action': t['conv_fail_a']
+                    'code': 'FORMULA_ERR',
+                    'title': t['formula_t'].format(n=len(formula_errors)),
+                    'description': t['formula_d'] + sample_text,
+                    'action': t['formula_a'],
+                    'detail': formula_errors[:10],
                 })
-                return {'checks': checks, 'summary': {'total': len(checks)}, 'metadata': metadata}
+            
+            if len(na_errors) > 50:
+                checks.append({
+                    'category': t['cat_formula'], 'severity': 'LOW',
+                    'code': 'NA_MANY',
+                    'title': t['na_many_t'].format(n=len(na_errors)),
+                    'description': t['na_many_d'],
+                    'action': t['na_many_a'],
+                })
+            
+            if external_refs:
+                sample = external_refs[:3]
+                sample_text = '; '.join([f"{e['sheet']}!{e['cell']}" for e in sample])
+                checks.append({
+                    'category': t['cat_formula'], 'severity': 'MEDIUM',
+                    'code': 'EXT_REF',
+                    'title': t['ext_ref_t'].format(n=len(external_refs)),
+                    'description': t['ext_ref_d'] + sample_text,
+                    'action': t['ext_ref_a'],
+                    'detail': external_refs[:10],
+                })
         except Exception as e:
             checks.append({
                 'category': t['cat_formula'], 'severity': 'HIGH',
-                'code': 'CONV_ERR', 'title': t['conv_err_t'],
-                'description': t['conv_err_d'] + str(e)[:100],
-                'action': t['conv_err_a']
+                'code': 'PARSE_ERR',
+                'title': t['parse_err_t'],
+                'description': t['parse_err_d'] + str(e)[:100],
+                'action': t['parse_err_a'],
             })
-            return {'checks': checks, 'summary': {'total': len(checks)}, 'metadata': metadata}
-    
-    # ═══ 1. 수식 오류 체크 ═══
-    try:
-        wb = load_workbook(xlsx_path, data_only=False)
-        sheet_names = wb.sheetnames
-        metadata['sheets'] = sheet_names
-        metadata['sheet_count'] = len(sheet_names)
-        
-        formula_errors = []    # 심각한 수식 에러 (#NAME?, #REF!, #DIV/0!, #VALUE!)
-        na_errors = []          # #N/A는 별도 (VLOOKUP 정상 미스매치 가능)
-        external_refs = []     # 외부 파일 참조
-        
-        for sheet_name in sheet_names:
-            ws = wb[sheet_name]
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.value is None:
+    else:
+        # xlsx 변환 불가 → 수식 체크 스킵, 메타데이터는 pyxlsb로 수집
+        try:
+            xlsb_path = filepath if filepath.endswith('.xlsb') else filepath.replace('.xlsx', '.xlsb')
+            with open_xlsb(xlsb_path) as wb_v:
+                sheet_names = list(wb_v.sheets)
+                metadata['sheets'] = sheet_names
+                metadata['sheet_count'] = len(sheet_names)
+                # xlsb에서도 #REF! / #VALUE! 등 에러 값은 파싱 가능 (값 기반)
+                formula_errors = []
+                for sheet_name in sheet_names[:20]:  # 상위 20개 시트만 (속도)
+                    try:
+                        with wb_v.get_sheet(sheet_name) as ws:
+                            for r_idx, row in enumerate(ws.rows()):
+                                if r_idx > 300: break  # 각 시트 300행까지만
+                                for cell in row:
+                                    if cell.v is None: continue
+                                    val_str = str(cell.v)
+                                    for err in ['#NAME?', '#REF!', '#DIV/0!', '#VALUE!', '#NULL!']:
+                                        if err in val_str:
+                                            formula_errors.append({
+                                                'sheet': sheet_name,
+                                                'cell': f"R{r_idx}",
+                                                'error': err,
+                                            })
+                                            break
+                    except Exception:
                         continue
-                    val_str = str(cell.value)
-                    # 심각한 수식 에러
-                    for err in ['#NAME?', '#REF!', '#DIV/0!', '#VALUE!', '#NULL!']:
-                        if err in val_str:
-                            formula_errors.append({
-                                'sheet': sheet_name,
-                                'cell': cell.coordinate,
-                                'error': err,
-                                'formula': val_str[:100],
-                            })
-                            break
-                    # #N/A 별도
-                    if '#N/A' in val_str:
-                        na_errors.append({'sheet': sheet_name, 'cell': cell.coordinate})
-                    # 외부 파일 참조 ([C:\...] 또는 [...\path\file.xlsx])
-                    if '[' in val_str and ('\\' in val_str or '.xls' in val_str):
-                        # 단, 이미 error로 잡힌 건 skip
-                        if not any(e in val_str for e in ['#NAME?', '#REF!']):
-                            external_refs.append({
-                                'sheet': sheet_name,
-                                'cell': cell.coordinate,
-                                'ref': val_str[:150],
-                            })
-        
-        if formula_errors:
-            # 상위 5개만 표시
-            sample = formula_errors[:5]
-            sample_text = '; '.join([f"{e['sheet']}!{e['cell']}({e['error']})" for e in sample])
-            checks.append({
-                'category': t['cat_formula'], 'severity': 'HIGH',
-                'code': 'FORMULA_ERR',
-                'title': t['formula_t'].format(n=len(formula_errors)),
-                'description': t['formula_d'] + sample_text,
-                'action': t['formula_a'],
-                'detail': formula_errors[:10],
-            })
-        
-        if len(na_errors) > 50:  # 50개 이상이면 이슈로 판단
-            checks.append({
-                'category': t['cat_formula'], 'severity': 'LOW',
-                'code': 'NA_MANY',
-                'title': t['na_many_t'].format(n=len(na_errors)),
-                'description': t['na_many_d'],
-                'action': t['na_many_a'],
-            })
-        
-        if external_refs:
-            sample = external_refs[:3]
-            sample_text = '; '.join([f"{e['sheet']}!{e['cell']}" for e in sample])
-            checks.append({
-                'category': t['cat_formula'], 'severity': 'MEDIUM',
-                'code': 'EXT_REF',
-                'title': t['ext_ref_t'].format(n=len(external_refs)),
-                'description': t['ext_ref_d'] + sample_text,
-                'action': t['ext_ref_a'],
-                'detail': external_refs[:10],
-            })
-    except Exception as e:
-        checks.append({
-            'category': t['cat_formula'], 'severity': 'HIGH',
-            'code': 'PARSE_ERR',
-            'title': t['parse_err_t'],
-            'description': t['parse_err_d'] + str(e)[:100],
-            'action': t['parse_err_a'],
-        })
+                if formula_errors:
+                    sample = formula_errors[:5]
+                    sample_text = '; '.join([f"{e['sheet']}!{e['cell']}({e['error']})" for e in sample])
+                    checks.append({
+                        'category': t['cat_formula'], 'severity': 'HIGH',
+                        'code': 'FORMULA_ERR_VAL',
+                        'title': t['formula_t'].format(n=len(formula_errors)),
+                        'description': t['formula_d'] + sample_text,
+                        'action': t['formula_a'],
+                        'detail': formula_errors[:10],
+                    })
+        except Exception:
+            pass
     
     # ═══ 2. Capital Stack 정합성 (값 기반 체크) ═══
     try:
