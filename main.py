@@ -6,30 +6,47 @@ from pydantic import BaseModel
 MACRS_5YR = [0.20, 0.32, 0.192, 0.1152, 0.1152, 0.0576]
 
 def _irr_robust(cfs, guess=0.08):
-    """여러 초기값으로 Newton 반복 → 양수 수렴값 반환"""
+    """여러 초기값으로 Newton 반복 → 양수 수렴값 반환.
+    Overflow 방지: r은 [-0.99, 10.0] 범위로 클램핑."""
     import numpy as np
     def newton(g):
         r = g
         for _ in range(2000):
-            npv  = sum(cf/(1+r)**t for t,cf in enumerate(cfs))
-            dnpv = sum(-t*cf/(1+r)**(t+1) for t,cf in enumerate(cfs))
+            # r이 너무 극단값이면 cf/(1+r)**t overflow — 안전 범위 클램핑
+            if r <= -0.99: r = -0.99
+            elif r >= 10.0: r = 10.0
+            try:
+                npv  = sum(cf/(1+r)**t for t,cf in enumerate(cfs))
+                dnpv = sum(-t*cf/(1+r)**(t+1) for t,cf in enumerate(cfs))
+            except (OverflowError, ZeroDivisionError):
+                return None  # 발산 — 실패 신호
             if abs(dnpv) < 1e-12: break
             r_new = r - npv/dnpv
-            if r_new <= -0.999: r_new = 0.001
+            # 한 step 이동 제한 (안정화)
+            if r_new <= -0.99: r_new = -0.99
+            elif r_new >= 10.0: r_new = 10.0
             if abs(r_new - r) < 1e-8: return r_new
             r = r_new
         return r
-    for g in [guess, 0.01, 0.03, 0.05, 0.10, 0.15]:
+    for g in [guess, 0.01, 0.03, 0.05, 0.10, 0.15, 0.20, -0.05]:
         r = newton(g)
-        if r > 0:
-            chk = sum(cf/(1+r)**t for t,cf in enumerate(cfs))
-            if abs(chk) < 500:  # $500K 오차 허용
-                return r
+        if r is None: continue  # 발산 스킵
+        if -0.5 < r < 5.0:  # 합리적 IRR 범위
+            try:
+                chk = sum(cf/(1+r)**t for t,cf in enumerate(cfs))
+                if abs(chk) < 500:  # $500K 오차 허용
+                    return r
+            except (OverflowError, ZeroDivisionError):
+                continue
+    # numpy_financial fallback
     try:
+        import numpy_financial as npf
         r0 = float(npf.irr(cfs))
-        return r0 if not np.isnan(r0) else 0.0
+        if not np.isnan(r0) and -0.5 < r0 < 5.0:
+            return r0
     except Exception:
-        return 0.0
+        pass
+    return None  # 진짜 해 없음 (caller가 처리)
 import requests
 import jwt
 import os
@@ -1470,7 +1487,11 @@ def _calc_engine(inputs: dict) -> dict:
     lirr = _irr_robust(pretax_cfs, guess=0.10)   # Sponsor pretax levered (Neptune Row 26 ~10%)
     uirr = _irr_robust(unlev_cfs, guess=0.05)    # Asset-level unlevered (Neptune Row 27 ~8%)
     sirr = _irr_robust(sponsor_cfs, guess=0.10)  # Sponsor after-tax w/ MACRS (Full Life)
-    sirr_c = float(npf.irr(sponsor_cfs[:ppa_term+1]))
+    try:
+        sirr_c = float(npf.irr(sponsor_cfs[:ppa_term+1]))
+        if np.isnan(sirr_c): sirr_c = None
+    except Exception:
+        sirr_c = None
     ebitda_yield = ebitda_yr1/total_capex*100 if total_capex else 0
 
     # ── NPV 계산 (Hurdle 기준 할인) ────────────────────────────────
@@ -1511,10 +1532,10 @@ def _calc_engine(inputs: dict) -> dict:
         'dev_margin':    round(dev_margin,0),
         'epc_margin':    round(epc_margin,0),
         'total_margin':  round(total_margin,0),
-        'levered_irr':   round(lirr,6) if not np.isnan(lirr) else None,
-        'unlevered_irr': round(uirr,6) if not np.isnan(uirr) else None,
-        'sponsor_irr':   round(sirr,6) if not np.isnan(sirr) else None,
-        'sponsor_irr_contract': round(sirr_c,6) if not np.isnan(sirr_c) else None,
+        'levered_irr':   round(lirr,6) if (lirr is not None and not np.isnan(lirr)) else None,
+        'unlevered_irr': round(uirr,6) if (uirr is not None and not np.isnan(uirr)) else None,
+        'sponsor_irr':   round(sirr,6) if (sirr is not None and not np.isnan(sirr)) else None,
+        'sponsor_irr_contract': round(sirr_c,6) if (sirr_c is not None and not np.isnan(sirr_c)) else None,
         'sponsor_npv':   round(sponsor_npv,0) if sponsor_npv is not None else None,
         'project_npv':   round(project_npv,0) if project_npv is not None else None,
         'wacc':          round(wacc,6),
@@ -1859,11 +1880,19 @@ def break_even(req: BreakEvenRequest, user=Depends(get_current_user)):
         max_iter = 10
 
         def calc_irr(ppa_val):
-            """Calc engine 호출 → Sponsor IRR (Full Life 우선) 반환"""
+            """Calc engine 호출 → Sponsor IRR (Full Life 우선) 반환.
+            엔진 발산 시 None 반환 (caller가 처리)."""
             inp = dict(base_inputs)
             inp["ppa_price"] = ppa_val
-            res = _calc_engine(inp)
-            return res.get("sponsor_irr") or res.get("sponsor_irr_contract") or 0.0
+            try:
+                res = _calc_engine(inp)
+            except Exception:
+                return None
+            # sponsor_irr 우선, 없으면 contract, 둘 다 None이면 None
+            s_irr = res.get("sponsor_irr")
+            if s_irr is None:
+                s_irr = res.get("sponsor_irr_contract")
+            return s_irr  # None or float
 
         # ── Phase 1: ±25% 민감도 스캔 ──
         pcts = [-25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25]
@@ -1874,7 +1903,7 @@ def break_even(req: BreakEvenRequest, user=Depends(get_current_user)):
             sensitivity.append({
                 "pct": pct,
                 "ppa": round(ppa_p, 2),
-                "irr_pct": round(irr_p * 100, 4)
+                "irr_pct": round(irr_p * 100, 4) if irr_p is not None else None
             })
 
         # ── Phase 2: Newton-Raphson ──
@@ -1883,22 +1912,65 @@ def break_even(req: BreakEvenRequest, user=Depends(get_current_user)):
         status = "not_started"
         solution = None
 
-        # 가능 여부 체크: ±25% 범위에 Target이 있는지
-        min_irr = sensitivity[0]["irr_pct"]
-        max_irr = sensitivity[-1]["irr_pct"]
+        # Sensitivity에서 유효한 값만 추출
+        valid_sens = [s for s in sensitivity if s["irr_pct"] is not None]
+        if not valid_sens:
+            # 엔진이 모든 PPA에서 발산 — break-even 불가
+            status = "engine_diverged"
+            solution = {
+                "ppa": base_ppa,
+                "irr_pct": 0,
+                "error_pct": 0,
+                "iterations": 0,
+                "converged": False,
+            }
+            base_res = _calc_engine(base_inputs)
+            return {
+                "ok": True,
+                "base_ppa": base_ppa,
+                "target_irr_pct": req.target_irr_pct,
+                "sensitivity": sensitivity,
+                "iterations": iterations,
+                "solution": solution,
+                "status": status,
+                "tolerance_pct": tol * 100,
+                "dev_margin_k": base_res.get("dev_margin", 0),
+            }
+
+        min_irr = min(s["irr_pct"] for s in valid_sens)
+        max_irr = max(s["irr_pct"] for s in valid_sens)
         target_irr_pct = target_irr * 100
 
-        if target_irr_pct < min_irr or target_irr_pct > max_irr:
-            # 범위 밖: 가장 가까운 끝 PPA로 시작 (그래도 시도)
-            if target_irr_pct < min_irr:
-                ppa = base_ppa * 0.75
-                status = "target_below_range"
-            else:
-                ppa = base_ppa * 1.25
-                status = "target_above_range"
+        # Target이 sensitivity 범위 안에 있는지 먼저 확인
+        # 범위 안에 있으면 linear interpolation으로 초기값 설정 (Newton-Raphson에 좋은 시작점)
+        if min_irr <= target_irr_pct <= max_irr:
+            # 두 인접 sens point 사이에서 linear interp
+            sorted_sens = sorted(valid_sens, key=lambda s: s["ppa"])
+            for i in range(len(sorted_sens) - 1):
+                lo = sorted_sens[i]
+                hi = sorted_sens[i+1]
+                if (lo["irr_pct"] <= target_irr_pct <= hi["irr_pct"]) or \
+                   (hi["irr_pct"] <= target_irr_pct <= lo["irr_pct"]):
+                    # linear interp on PPA
+                    if hi["irr_pct"] != lo["irr_pct"]:
+                        frac = (target_irr_pct - lo["irr_pct"]) / (hi["irr_pct"] - lo["irr_pct"])
+                        ppa = lo["ppa"] + frac * (hi["ppa"] - lo["ppa"])
+                    else:
+                        ppa = (lo["ppa"] + hi["ppa"]) / 2
+                    break
+        elif target_irr_pct < min_irr:
+            ppa = base_ppa * 0.75
+            status = "target_below_range"
+        else:
+            ppa = base_ppa * 1.25
+            status = "target_above_range"
 
         for i in range(max_iter):
             irr_cur = calc_irr(ppa)
+            if irr_cur is None:
+                # 엔진 발산 → 이 PPA에선 IRR 못 구함, loop 종료
+                status = "engine_diverged_mid"
+                break
             err = irr_cur - target_irr
             iterations.append({
                 "iter": i,
@@ -1919,9 +1991,12 @@ def break_even(req: BreakEvenRequest, user=Depends(get_current_user)):
                 status = "converged"
                 break
 
-            # 미분 (central difference)
+            # 미분 (central difference) — 양쪽 발산 체크
             irr_plus = calc_irr(ppa + h)
             irr_minus = calc_irr(ppa - h)
+            if irr_plus is None or irr_minus is None:
+                status = "engine_diverged_deriv"
+                break
             derivative = (irr_plus - irr_minus) / (2 * h)
 
             if abs(derivative) < 1e-8:
