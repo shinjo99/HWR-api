@@ -1439,27 +1439,24 @@ def _calc_engine(inputs: dict) -> dict:
             s_tax += ptc_benefit * current_depr_share
 
         op_cf = ebitda - ds - aug_c
-        if yr<=flip_term:
-            s_cf = op_cf*(1-pre_flip_cash_te) + s_tax
-        else:
-            s_cf = op_cf*(1-post_flip_cash_te) + s_tax
+        # ── Sponsor CF: Neptune Returns Row 25 방식 ──
+        # Row 25 = Row 19 (Partnership) - Row 21 (Debt net) - Row 22 (TE dist) + Row 23 (Pay-Go)
+        # TE distribution은 Partnership CF에 비례 (Debt와 독립)
+        # 이전 엔진은 op_cf × (1-TE%) 로 계산했으나, 이는 Debt 영향을 TE 배분에 섞음 → 교정
+        te_cash_pct = pre_flip_cash_te if yr <= flip_term else post_flip_cash_te
+        te_dist_cash = partnership_cf * te_cash_pct
+        s_cf = partnership_cf - ds - te_dist_cash + s_tax
 
-        # Flip Year event: TE buyout 직후 Sponsor 일시 대금 수령 (Neptune Y10 pattern)
-        if yr == flip_term + 3 and flip_event_cf > 0:  # Y10 if flip_term=7
+        # Flip Year event: TE buyout 직후 Sponsor 일시 대금 수령
+        if yr == flip_term + 1 and flip_event_cf > 0:
             s_cf += flip_event_cf
 
-        s_cf_pretax = op_cf*(1-pre_flip_cash_te) if yr<=flip_term else op_cf*(1-post_flip_cash_te)
+        s_cf_pretax = partnership_cf - ds - te_dist_cash
 
         # Unlevered aftertax CF (Neptune R51 구조):
         # = Partnership CF - TE distribution (Debt 제외한 Sponsor+TE 관점)
-        # TE dist는 pre_flip_cash_te × op_cf (op_cf = ebitda - ds - aug)
-        # 하지만 Unlev에서는 ds 제외 → Partnership × te_share 구조
-        # 
-        # Neptune Y1: Partnership 52,814, TE -4,874 → R48 Y1 = 47,940
-        # 실제 내 엔진에선 pre_flip_cash_te = 25.5% 이지만 TE 9.2%가 Partnership 기준
-        # 간단히: unlev = partnership - te_distribution (debt는 빼지 않음)
-        te_dist_pct = 0.092 if yr <= flip_term + 2 else 0.05  # Neptune 실측
-        te_dist_unlev = partnership_cf * te_dist_pct
+        # TE dist 비율은 위 Sponsor CF와 동일한 te_cash_pct 사용 (일관성)
+        te_dist_unlev = partnership_cf * te_cash_pct
         unlev_aftertax_cf = partnership_cf - te_dist_unlev + (ptc_benefit if credit_mode == 'PTC' and yr <= 10 else 0)
 
         cashflows.append(op_cf); unlev_cfs.append(unlev_aftertax_cf); sponsor_cfs.append(s_cf); pretax_cfs.append(s_cf_pretax)
@@ -1552,8 +1549,11 @@ _CALIB_STRUCTURAL = {
     'cap_interest_m': 14.3,
     'debt_drawdown_ratio': 0.775,
     'te_proceeds_ratio': 0.935,
-    'pre_flip_cash_te': 25.5,
-    'post_flip_cash_te': 7,
+    # Neptune Returns 시트 Row 22 실측: TE dist ≈ 10% of Partnership CF (Y1-9)
+    # Y10에서 5%로 내려감 (Flip effective Y10) → flip_term = 9
+    'pre_flip_cash_te': 10.0,
+    'post_flip_cash_te': 5.0,
+    'flip_term': 9,
     'depr_share': 0.7721,
     'use_nol_offset': True,
     'use_sculpted_debt': True,
