@@ -1102,7 +1102,19 @@ def _calc_engine(inputs: dict) -> dict:
     itc_rate   = itc_rate / 100
     te_mult    = inputs.get('te_mult', 1.115)
     yield_adj  = 1 / (1 + (flip_yield - 0.0875) * 8)
-    te_invest  = min(total_capex * itc_elig * itc_rate * te_mult * yield_adj, total_capex * 0.36)
+
+    # ── TE Invest 산정 + Sponsor Equity 최소선 확보 ──────────────────
+    # 1) 이론치: ITC 기반 TE 투자 규모
+    te_theoretical = total_capex * itc_elig * itc_rate * te_mult * yield_adj
+
+    # 2) 구조적 상한: Debt + TE + Sponsor Eq = CAPEX, Sponsor Eq는 최소 10% CAPEX 확보
+    #    (Sponsor Eq <5% 되면 IRR 계산 왜곡 — Sponsor 기여도가 미미해서 IRR 발산)
+    min_sponsor_eq_pct = inputs.get('min_sponsor_eq_pct', 10.0) / 100  # 기본 10% of CAPEX
+    max_te_invest = total_capex - debt - total_capex * min_sponsor_eq_pct
+
+    # 3) 실제 TE 투자: 이론치와 구조적 상한 중 작은 값
+    te_invest = max(0, min(te_theoretical, max_te_invest))
+
     sponsor_eq = total_capex - debt - te_invest
     effective_eq = sponsor_eq * (1 - int_rate * 0.75)
 
@@ -1213,9 +1225,33 @@ def _calc_engine(inputs: dict) -> dict:
 
     lirr = _irr_robust(pretax_cfs, guess=0.10)   # Sponsor pretax levered (Neptune Row 26 ~10%)
     uirr = _irr_robust(unlev_cfs, guess=0.05)    # Asset-level unlevered (Neptune Row 27 ~8%)
-    sirr = _irr_robust(sponsor_cfs, guess=0.10)  # Sponsor after-tax w/ MACRS
+    sirr = _irr_robust(sponsor_cfs, guess=0.10)  # Sponsor after-tax w/ MACRS (Full Life)
     sirr_c = float(npf.irr(sponsor_cfs[:ppa_term+1]))
     ebitda_yield = ebitda_yr1/total_capex*100 if total_capex else 0
+
+    # ── NPV 계산 (Hurdle 기준 할인) ────────────────────────────────
+    # Sponsor NPV: Hurdle IRR(예: 10%)로 할인 — 매수자 관점 가치
+    # Project NPV: WACC로 할인 — 프로젝트 자체 가치
+    hurdle_sponsor = inputs.get('hurdle_sponsor_irr', 10.0) / 100  # Default 10%
+    # WACC 계산 (approximation): tax-adjusted weighted cost
+    wacc_debt_cost = int_rate * (1 - tax_rate)  # after-tax
+    wacc_te_cost = 0.07   # TE 조달 비용 (typical)
+    wacc_eq_cost = 0.11   # Sponsor eq 비용 (typical)
+    debt_w = debt / total_capex if total_capex else 0
+    te_w = te_invest / total_capex if total_capex else 0
+    eq_w = sponsor_eq / total_capex if total_capex else 0
+    wacc = (debt_w * wacc_debt_cost) + (te_w * wacc_te_cost) + (eq_w * wacc_eq_cost)
+    if wacc <= 0 or wacc > 0.5: wacc = 0.072  # fallback
+
+    def _npv(cfs, rate):
+        try:
+            return float(npf.npv(rate, cfs))
+        except Exception:
+            return None
+
+    sponsor_npv = _npv(sponsor_cfs, hurdle_sponsor)
+    project_npv = _npv(unlev_cfs, wacc)
+    # ───────────────────────────────────────────────────────────────
 
     return {
         'capex_total':   round(total_capex,0),
@@ -1231,6 +1267,10 @@ def _calc_engine(inputs: dict) -> dict:
         'unlevered_irr': round(uirr,6) if not np.isnan(uirr) else None,
         'sponsor_irr':   round(sirr,6) if not np.isnan(sirr) else None,
         'sponsor_irr_contract': round(sirr_c,6) if not np.isnan(sirr_c) else None,
+        'sponsor_npv':   round(sponsor_npv,0) if sponsor_npv is not None else None,
+        'project_npv':   round(project_npv,0) if project_npv is not None else None,
+        'wacc':          round(wacc,6),
+        'hurdle_sponsor_irr_used': round(hurdle_sponsor,6),
         'ebitda_yield':  round(ebitda_yield,2),
         'aug_cost_ea':   round(aug_cost_ea,0),
         'annual_detail': detail,
@@ -1271,11 +1311,11 @@ def break_even(req: BreakEvenRequest, user=Depends(get_current_user)):
         max_iter = 10
 
         def calc_irr(ppa_val):
-            """Calc engine을 호출해 Sponsor IRR 반환"""
+            """Calc engine 호출 → Sponsor IRR (Full Life 우선) 반환"""
             inp = dict(base_inputs)
             inp["ppa_price"] = ppa_val
             res = _calc_engine(inp)
-            return res.get("sponsor_irr_contract") or res.get("sponsor_irr") or 0.0
+            return res.get("sponsor_irr") or res.get("sponsor_irr_contract") or 0.0
 
         # ── Phase 1: ±25% 민감도 스캔 ──
         pcts = [-25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25]
@@ -2576,7 +2616,7 @@ p {{ margin: 4pt 0; color: #1F2937; }}
   <h2>Investment Thresholds (기준 달성)</h2>
   <div class="thr-box">
     <div class="thr-item">
-      <div class="thr-label">Sponsor IRR (Levered Pre-Tax, min {thr_irr}%)</div>
+      <div class="thr-label">Sponsor IRR (After-TE-Flip, Full Life · min {thr_irr}%)</div>
       <div class="thr-status">{_chk(thr_irr_ok)}</div>
       <div class="thr-gap">{thr_irr_gap}</div>
     </div>
@@ -2728,8 +2768,11 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
     itc_thr    = thresholds.get("itc_min_pct", 30.0)
 
     curr_irr    = current_metrics.get("sponsor_irr_pct", "?")
+    curr_irr_basis = current_metrics.get("sponsor_irr_basis", "After-TE-Flip, Full Life")
     curr_margin = current_metrics.get("dev_margin_cwp", "?")
     curr_itc    = current_metrics.get("itc_rate_pct", "?")
+    sponsor_npv_m = current_metrics.get("sponsor_npv_m")  # $M (optional)
+    project_npv_m = current_metrics.get("project_npv_m")  # $M (optional)
     ppa_term    = current_metrics.get("ppa_term", "?")
     toll_term   = current_metrics.get("toll_term", "?")
     pv_mwac     = current_metrics.get("pv_mwac", "?")
@@ -2859,21 +2902,24 @@ async def analyze_cf(payload: dict, user=Depends(get_current_user)):
         + market_block +
 
         "=== INVESTMENT THRESHOLDS (firm hurdles) ===\n"
-        f"  Minimum Dev Margin : {margin_thr} c/Wp\n"
-        f"  Minimum Sponsor IRR: {irr_thr}% (Levered Pre-Tax)\n\n"
+        f"  Primary   · Sponsor IRR ≥ {irr_thr}% (After-TE-Flip, Full Life) — 매수자 요구 수익률\n"
+        f"  Secondary · Dev Margin  ≥ {margin_thr} c/Wp — HEUH 내부 마진 기준\n"
+        "  Both must PASS for IC approval.\n\n"
 
         "=== CURRENT PROJECT METRICS ===\n"
-        f"  Dev Margin : {curr_margin} c/Wp\n"
-        f"  Sponsor IRR: {curr_irr}% (Levered Pre-Tax)\n"
+        f"  Sponsor IRR : {curr_irr}% ({curr_irr_basis})\n"
+        f"  Dev Margin  : {curr_margin} c/Wp\n"
+        + (f"  Sponsor NPV : ${sponsor_npv_m}M (discounted at {irr_thr}% hurdle)\n" if sponsor_npv_m is not None else "")
+        + (f"  Project NPV : ${project_npv_m}M (discounted at WACC)\n" if project_npv_m is not None else "")
         + wacc_block +
-        f"  ITC Rate   : {curr_itc}%\n"
-        f"  PPA Term   : {ppa_term} yrs | Toll Term: {toll_term} yrs\n\n"
+        f"  ITC Rate    : {curr_itc}%\n"
+        f"  PPA Term    : {ppa_term} yrs | Toll Term: {toll_term} yrs\n\n"
 
         "═══ VERDICT FRAMEWORK (PURE ECONOMICS ONLY) ═══\n"
         "The verdict is determined ONLY by economic criteria. Development risks are monitoring items and do NOT affect verdict.\n\n"
         "Economic criteria:\n"
         "  1. Dev Margin vs threshold (primary: HEUH's exit value)\n"
-        "  2. Sponsor IRR (Levered Pre-Tax) vs threshold (market-clearing for buyer)\n"
+        "  2. Sponsor IRR (After-TE-Flip, Full Life) vs threshold (market-clearing for buyer)\n"
         "  3. Unlevered IRR vs WACC (true value creation — leverage-independent)\n\n"
         "VERDICT RULES:\n"
         "  PROCEED:\n"
