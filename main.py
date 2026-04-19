@@ -1339,9 +1339,11 @@ def _calc_engine(inputs: dict) -> dict:
     #   Neptune R51 Y0 = -385,453 → CAPEX -639,855에서 +254,402 TE proceeds 반영 + 추가 조정
     #   단순화: Unlev는 project 전체 관점이므로 full CAPEX
     effective_itc_value = total_capex * itc_elig * effective_itc_rate
-    # Unlev Y0 (Neptune R51 방식): -Construction - Txn - CapInt + TE proceeds
-    # Sponsor 입장에서 Debt 영향 제외한 project cash outflow
-    unlev_y0 = -(construction_cost + txn_costs + cap_interest) + te_proceeds
+    # Unlev Y0 (Neptune Row 26 방식): -Construction + TE proceeds
+    # Neptune Row 26 Y0 = -385,453 ≈ -639,855 + 254,405 (Construction - TE proceeds)
+    # txn + cap_interest는 Partnership 관점에서 Y0 cash flow 이전의 financing 비용이라
+    # Unlevered IRR 계산에는 포함 안 함 (엑셀 실측 일치)
+    unlev_y0 = -construction_cost + te_proceeds
 
     cashflows=[-effective_eq]; unlev_cfs=[unlev_y0]
     sponsor_cfs=[-sponsor_y0_cash]; pretax_cfs=[-sponsor_y0_cash]
@@ -1474,7 +1476,7 @@ def _calc_engine(inputs: dict) -> dict:
     # ── NPV 계산 (Hurdle 기준 할인) ────────────────────────────────
     # Sponsor NPV: Hurdle IRR(예: 10%)로 할인 — 매수자 관점 가치
     # Project NPV: WACC로 할인 — 프로젝트 자체 가치
-    hurdle_sponsor = inputs.get('hurdle_sponsor_irr', 10.0) / 100  # Default 10%
+    hurdle_sponsor = inputs.get('hurdle_sponsor_irr', 9.0) / 100  # Default 9%
     # WACC 계산 (approximation): tax-adjusted weighted cost
     wacc_debt_cost = int_rate * (1 - tax_rate)  # after-tax
     wacc_te_cost = 0.07   # TE 조달 비용 (typical)
@@ -1549,9 +1551,9 @@ _CALIB_STRUCTURAL = {
     'cap_interest_m': 14.3,
     'debt_drawdown_ratio': 0.775,
     'te_proceeds_ratio': 0.935,
-    # Neptune Returns 시트 Row 22 실측: TE dist ≈ 10% of Partnership CF (Y1-9)
+    # Neptune Returns 시트 Row 22 실측: TE dist ≈ 9.2% of Partnership CF (Y1-9)
     # Y10에서 5%로 내려감 (Flip effective Y10) → flip_term = 9
-    'pre_flip_cash_te': 10.0,
+    'pre_flip_cash_te': 9.2,
     'post_flip_cash_te': 5.0,
     'flip_term': 9,
     'depr_share': 0.7721,
