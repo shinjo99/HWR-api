@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 # WeasyPrint가 필요로 하는 시스템 라이브러리
 # + 한글 폰트 (Noto Sans CJK)
+# + libreoffice-calc (xlsb → xlsx 변환용, Model Integrity Check 수식 분석)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libpangoft2-1.0-0 \
@@ -12,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     shared-mime-info \
     fonts-noto-cjk \
     fonts-noto-cjk-extra \
+    libreoffice-calc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

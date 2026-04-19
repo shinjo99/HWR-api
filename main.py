@@ -2193,6 +2193,24 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
             'reason_irr_invert': 'Contract > Full IRR 역전 (Neptune 패턴)',
             'reason_debt_ratio': 'Debt 비율 {r:.1f}% (Neptune 유사 47.6%)',
             'reason_te_ratio': 'TE 비율 {r:.1f}% (Neptune 유사 32.5%)',
+            # Capital Stack mismatch
+            'stack_mismatch_t': 'Capital Stack 합산 불일치 ({pct:.1f}% 오차)',
+            'stack_mismatch_d': 'CAPEX ${capex:,.1f}M ≠ Debt ${debt:,.1f}M + TE ${te:,.1f}M + Eq ${eq:,.1f}M (합계 ${sum:,.1f}M, 차이 ${diff:+,.1f}M)',
+            'stack_mismatch_a': '모델의 Capital Stack 섹션에서 자금조달 출처별 금액 재검토 필요. 누락된 자금원 or 이중계산 가능성.',
+            # DSCR
+            'dscr_low_t': 'DSCR 부족 (최소 {v:.2f}x < 1.0)',
+            'dscr_low_d': '특정 연도에 EBITDA가 Debt Service를 감당하지 못함. Covenant breach 가능성.',
+            'dscr_low_a': 'Debt 스케줄 재검토 또는 상환 조건 완화 필요',
+            'dscr_tight_t': 'DSCR 타이트 (최소 {v:.2f}x, 업계 표준 ≥ 1.20)',
+            'dscr_tight_d': '기술적 Default 위험은 낮으나 업계 관행 대비 커버리지 여유 작음.',
+            'dscr_tight_a': '대주단이 통상 요구하는 DSCR 1.20~1.30x 대비 낮음. 금융조건 확인',
+            # Value range sanity
+            'range_t': '값 범위 이상 {n}개',
+            'range_a': '업계 일반 범위를 벗어난 값. 입력 오타 or 특수 구조 가능성 확인',
+            'range_debt': 'Debt 비율 {v:.1f}% (정상 25~75%)',
+            'range_te': 'TE 비율 {v:.1f}% (정상 0~50%)',
+            'range_ppa': 'PPA ${v:.1f}/MWh (정상 $20~$200)',
+            'range_flip': 'Flip Yield {v:.2f}% (정상 5~15%)',
         },
         'en': {
             'cat_formula': 'Formula Errors', 'cat_capital': 'Capital Stack',
@@ -2271,6 +2289,24 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
             'reason_irr_invert': 'Contract > Full IRR inversion (Neptune pattern)',
             'reason_debt_ratio': 'Debt ratio {r:.1f}% (similar to Neptune 47.6%)',
             'reason_te_ratio': 'TE ratio {r:.1f}% (similar to Neptune 32.5%)',
+            # Capital Stack mismatch
+            'stack_mismatch_t': 'Capital Stack imbalance ({pct:.1f}% off)',
+            'stack_mismatch_d': 'CAPEX ${capex:,.1f}M ≠ Debt ${debt:,.1f}M + TE ${te:,.1f}M + Eq ${eq:,.1f}M (sum ${sum:,.1f}M, diff ${diff:+,.1f}M)',
+            'stack_mismatch_a': 'Review financing sources in the model. Possible missing source or double-counting.',
+            # DSCR
+            'dscr_low_t': 'DSCR insufficient (min {v:.2f}x < 1.0)',
+            'dscr_low_d': 'EBITDA fails to cover Debt Service in some year(s). Possible covenant breach.',
+            'dscr_low_a': 'Review debt schedule or relax repayment terms',
+            'dscr_tight_t': 'DSCR tight (min {v:.2f}x; industry standard ≥ 1.20)',
+            'dscr_tight_d': 'Technical default risk is low, but coverage cushion is thin vs market practice.',
+            'dscr_tight_a': 'Below typical lender requirement of 1.20–1.30x. Confirm financing terms.',
+            # Value range sanity
+            'range_t': '{n} values out of normal range',
+            'range_a': 'Values outside industry typical range. Check for typos or special structure.',
+            'range_debt': 'Debt ratio {v:.1f}% (normal 25–75%)',
+            'range_te': 'TE ratio {v:.1f}% (normal 0–50%)',
+            'range_ppa': 'PPA ${v:.1f}/MWh (normal $20–$200)',
+            'range_flip': 'Flip Yield {v:.2f}% (normal 5–15%)',
         },
     }
     t = T.get(lang, T['ko'])
@@ -2296,22 +2332,10 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
                 xlsx_path = candidate
             else:
                 xlsx_path = None
-                checks.append({
-                    'category': t['cat_formula'], 'severity': 'INFO',
-                    'code': 'FORMULA_SKIP',
-                    'title': t['formula_skip_t'],
-                    'description': t['formula_skip_d'],
-                    'action': t['formula_skip_a']
-                })
-        except Exception as e:
+                metadata['formula_text_analysis'] = 'skipped_no_libreoffice'
+        except Exception:
             xlsx_path = None
-            checks.append({
-                'category': t['cat_formula'], 'severity': 'INFO',
-                'code': 'FORMULA_SKIP',
-                'title': t['formula_skip_t'],
-                'description': t['formula_skip_d'],
-                'action': t['formula_skip_a']
-            })
+            metadata['formula_text_analysis'] = 'skipped_no_libreoffice'
     
     # ═══ 1. 수식 오류 체크 (xlsx_path 있을 때만) ═══
     if xlsx_path and xlsx_path != filepath:
@@ -2354,13 +2378,26 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
             if formula_errors:
                 sample = formula_errors[:5]
                 sample_text = '; '.join([f"{e['sheet']}!{e['cell']}({e['error']})" for e in sample])
+                from collections import Counter
+                sheet_counts = Counter(e['sheet'] for e in formula_errors)
+                sheet_samples = {}
+                for e in formula_errors:
+                    sh = e['sheet']
+                    if sh not in sheet_samples:
+                        sheet_samples[sh] = []
+                    if len(sheet_samples[sh]) < 3:
+                        sheet_samples[sh].append(e['cell'])
+                detail_by_sheet = [
+                    {'sheet': sh, 'count': cnt, 'cells': sheet_samples.get(sh, [])}
+                    for sh, cnt in sheet_counts.most_common()
+                ]
                 checks.append({
                     'category': t['cat_formula'], 'severity': 'HIGH',
                     'code': 'FORMULA_ERR',
                     'title': t['formula_t'].format(n=len(formula_errors)),
                     'description': t['formula_d'] + sample_text,
                     'action': t['formula_a'],
-                    'detail': formula_errors[:10],
+                    'detail_by_sheet': detail_by_sheet,
                 })
             
             if len(na_errors) > 50:
@@ -2399,37 +2436,83 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
                 sheet_names = list(wb_v.sheets)
                 metadata['sheets'] = sheet_names
                 metadata['sheet_count'] = len(sheet_names)
-                # xlsb에서도 #REF! / #VALUE! 등 에러 값은 파싱 가능 (값 기반)
+                # xlsb에서 #REF! / #VALUE! 등 에러 값 전수 조사
                 formula_errors = []
-                for sheet_name in sheet_names[:20]:  # 상위 20개 시트만 (속도)
+                na_count = 0
+                # Excel 컬럼 인덱스 → 문자 변환 (0→A, 25→Z, 26→AA)
+                def col_letter(idx):
+                    s = ''
+                    idx += 1  # 1-based
+                    while idx > 0:
+                        idx, r = divmod(idx - 1, 26)
+                        s = chr(65 + r) + s
+                    return s
+                for sheet_name in sheet_names:
                     try:
                         with wb_v.get_sheet(sheet_name) as ws:
                             for r_idx, row in enumerate(ws.rows()):
-                                if r_idx > 300: break  # 각 시트 300행까지만
                                 for cell in row:
                                     if cell.v is None: continue
                                     val_str = str(cell.v)
+                                    # 치명 에러
                                     for err in ['#NAME?', '#REF!', '#DIV/0!', '#VALUE!', '#NULL!']:
                                         if err in val_str:
+                                            try:
+                                                col_idx = cell.c  # pyxlsb cell has .c (column index, 0-based)
+                                            except AttributeError:
+                                                col_idx = None
+                                            coord = f"{col_letter(col_idx)}{r_idx+1}" if col_idx is not None else f"R{r_idx+1}"
                                             formula_errors.append({
                                                 'sheet': sheet_name,
-                                                'cell': f"R{r_idx}",
+                                                'cell': coord,
                                                 'error': err,
                                             })
                                             break
+                                    # #N/A 별도 카운트 (정상일 수도 있어서 50개 넘을 때만 경고)
+                                    if '#N/A' in val_str:
+                                        na_count += 1
                     except Exception:
                         continue
+                
+                # HIGH: 치명 에러
                 if formula_errors:
-                    sample = formula_errors[:5]
+                    sample = formula_errors[:8]
                     sample_text = '; '.join([f"{e['sheet']}!{e['cell']}({e['error']})" for e in sample])
+                    # 시트별 집계 (전체 기반, 상위 샘플 아닌 전체)
+                    from collections import Counter
+                    sheet_counts = Counter(e['sheet'] for e in formula_errors)
+                    # 각 시트에서 처음 발견된 에러 3개씩만 샘플 유지
+                    sheet_samples = {}
+                    for e in formula_errors:
+                        sh = e['sheet']
+                        if sh not in sheet_samples:
+                            sheet_samples[sh] = []
+                        if len(sheet_samples[sh]) < 3:
+                            sheet_samples[sh].append(e['cell'])
+                    # detail_by_sheet: 프론트에서 바로 렌더 가능한 구조
+                    detail_by_sheet = [
+                        {'sheet': sh, 'count': cnt, 'cells': sheet_samples.get(sh, [])}
+                        for sh, cnt in sheet_counts.most_common()
+                    ]
                     checks.append({
                         'category': t['cat_formula'], 'severity': 'HIGH',
                         'code': 'FORMULA_ERR_VAL',
                         'title': t['formula_t'].format(n=len(formula_errors)),
                         'description': t['formula_d'] + sample_text,
                         'action': t['formula_a'],
-                        'detail': formula_errors[:10],
+                        'detail_by_sheet': detail_by_sheet,
                     })
+                # LOW: #N/A 과다
+                if na_count > 50:
+                    checks.append({
+                        'category': t['cat_formula'], 'severity': 'LOW',
+                        'code': 'NA_MANY_VAL',
+                        'title': t['na_many_t'].format(n=na_count),
+                        'description': t['na_many_d'],
+                        'action': t['na_many_a'],
+                    })
+                metadata['formula_error_count'] = len(formula_errors)
+                metadata['na_count'] = na_count
         except Exception:
             pass
     
@@ -2687,61 +2770,54 @@ def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
                 pass
     except Exception:
         pass
-    
-    # ═══ 권장 Mode 자동 탐지 ═══
-    # Neptune과 유사한 구조 → Calibration mode 추천
-    # 일반 프로젝트 → Prediction mode 추천
-    recommended_mode = 'prediction'
-    mode_reasons = []
-    
-    # 지표 1: DSCR variance 크면 → sculpted debt (Neptune 유사)
-    if metadata.get('dscr_sample'):
-        vals = metadata['dscr_sample']
-        if vals and max(vals) - min(vals) > 0.5:
-            mode_reasons.append(t['reason_sculpted'])
-            recommended_mode = 'calibration'
-    
-    # 지표 2: Contract IRR > Full IRR → Merchant 구간 영향 크다는 신호 (Neptune 특성)
-    s_full = metadata.get('sponsor_full_irr')
-    s_contract = metadata.get('sponsor_contract_irr')
-    if s_full is not None and s_contract is not None:
-        sf = s_full * 100 if 0 < s_full < 1 else s_full
-        sc = s_contract * 100 if 0 < s_contract < 1 else s_contract
-        if sc > sf + 1.5:
-            mode_reasons.append(t['reason_irr_invert'])
-            recommended_mode = 'calibration'
-    
-    # 지표 3: Debt 비율 50% 이하 (Neptune 47.6%) → Calibration 유리
-    debt_r = metadata.get('debt_ratio', 0)
-    if 40 < debt_r < 55:
-        mode_reasons.append(t['reason_debt_ratio'].format(r=debt_r))
-    
-    # 지표 4: TE 비율 30%+ (Neptune 32.5%)
-    te_r = metadata.get('te_ratio', 0)
-    if te_r > 28:
-        mode_reasons.append(t['reason_te_ratio'].format(r=te_r))
-        recommended_mode = 'calibration'
-    
-    metadata['recommended_mode'] = recommended_mode
-    metadata['mode_reasons'] = mode_reasons
-    
-    # 추천 mode 체크 항목 추가
-    if recommended_mode == 'calibration':
-        checks.append({
-            'category': t['cat_summary'], 'severity': 'LOW',
-            'code': 'RECOMMEND_CALIB',
-            'title': t['rec_calib_t'],
-            'description': t['rec_calib_d'] + (", ".join(mode_reasons) if mode_reasons else t['rec_calib_none']),
-            'action': t['rec_calib_a'],
-        })
-    else:
-        checks.append({
-            'category': t['cat_summary'], 'severity': 'OK',
-            'code': 'RECOMMEND_PREDICT',
-            'title': t['rec_predict_t'],
-            'description': t['rec_predict_d'],
-            'action': t['rec_predict_a'],
-        })
+    # ═══ 추가 체크: DSCR 합리성 ═══
+    try:
+        dscr_samples = metadata.get('dscr_sample') or []
+        if dscr_samples:
+            min_dscr = min(dscr_samples)
+            if min_dscr < 1.0:
+                checks.append({
+                    'category': t['cat_debt'], 'severity': 'HIGH',
+                    'code': 'DSCR_INSUFFICIENT',
+                    'title': t['dscr_low_t'].format(v=min_dscr),
+                    'description': t['dscr_low_d'],
+                    'action': t['dscr_low_a'],
+                })
+            elif min_dscr < 1.20:
+                checks.append({
+                    'category': t['cat_debt'], 'severity': 'MEDIUM',
+                    'code': 'DSCR_TIGHT',
+                    'title': t['dscr_tight_t'].format(v=min_dscr),
+                    'description': t['dscr_tight_d'],
+                    'action': t['dscr_tight_a'],
+                })
+    except Exception:
+        pass
+
+    # ═══ 추가 체크: 값 범위 sanity ═══
+    try:
+        checks_range = []
+        debt_r = metadata.get('debt_ratio', 0)
+        te_r = metadata.get('te_ratio', 0)
+        ppa = metadata.get('ppa_price', 0)
+        
+        if debt_r > 0 and not (25 <= debt_r <= 75):
+            checks_range.append(t['range_debt'].format(v=debt_r))
+        if te_r > 0 and not (0 <= te_r <= 50):
+            checks_range.append(t['range_te'].format(v=te_r))
+        if ppa > 0 and not (20 <= ppa <= 200):
+            checks_range.append(t['range_ppa'].format(v=ppa))
+        
+        if checks_range:
+            checks.append({
+                'category': t['cat_summary'], 'severity': 'MEDIUM',
+                'code': 'RANGE_ANOMALY',
+                'title': t['range_t'].format(n=len(checks_range)),
+                'description': '; '.join(checks_range),
+                'action': t['range_a'],
+            })
+    except Exception:
+        pass
 
     # ═══ 체크 없음 (No Issues) — 긍정 신호 ═══
     if not checks:
