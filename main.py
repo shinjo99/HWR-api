@@ -1542,6 +1542,240 @@ def calculate_valuation(req: ValuationCalcRequest, user=Depends(get_current_user
         raise HTTPException(500, f"Calculation error: {str(e)}")
 
 
+# ══════════════════════════════════════════════════════════════
+# IRR 차이 분해 (Calibration vs Prediction)
+# ══════════════════════════════════════════════════════════════
+def _decompose_irr_difference(inputs_base: dict) -> dict:
+    """Calibration → Prediction 전환 시 각 요인이 IRR에 미치는 기여도 분해
+    
+    방법: 순차적 ON/OFF
+      1) Full Calibration IRR (starting point)
+      2) 각 Neptune-specific 파라미터를 하나씩 '해제' (Prediction 값으로)
+      3) 각 단계의 IRR 변화량 = 해당 요인의 기여도
+      4) 최종 = Prediction IRR
+    
+    4개 주요 요인:
+      - NOL 상쇄 (use_nol_offset)
+      - Sculpted Debt (use_sculpted_debt)
+      - Partnership Flip 25.5/7 vs 99/5
+      - Y0 현금 구조 (Construction < FMV)
+    
+    Returns:
+        {
+            'calib_irr': 11.14,
+            'predict_irr': 6.17,
+            'total_delta': 4.97,
+            'factors': [
+                {'name': 'NOL 상쇄', 'delta_pp': 3.2, 'from': '...', 'to': '...'},
+                ...
+            ]
+        }
+    """
+    def _get_irr(inp):
+        """Full Life Sponsor IRR (%)"""
+        try:
+            r = _calc_engine(inp)
+            v = r.get('sponsor_irr')
+            return (v * 100) if v is not None else 0.0
+        except:
+            return 0.0
+    
+    # Start: full calibration
+    base = dict(inputs_base)
+    base['calibration_mode'] = 'calibration'
+    calib_irr = _get_irr(base)
+    
+    # End point: full prediction
+    predict = dict(inputs_base)
+    predict['calibration_mode'] = 'prediction'
+    # prediction에서는 calibration 전용 파라미터 제거
+    for k in ['construction_cost_m', 'txn_costs_m', 'cap_interest_m',
+              'debt_drawdown_ratio', 'te_proceeds_ratio',
+              'pre_flip_cash_te', 'post_flip_cash_te',
+              'depr_share', 'use_nol_offset', 'use_sculpted_debt']:
+        predict.pop(k, None)
+    predict_irr = _get_irr(predict)
+    
+    total_delta = predict_irr - calib_irr  # 보통 음수 (Prediction이 낮음)
+    
+    factors = []
+    current = dict(base)  # Calibration 상태에서 시작
+    current_irr = calib_irr
+    
+    # 순서 중요: 영향 큰 구조적 요인부터 해제 (현실적 기여도 계산)
+    # 1. Partnership Flip (가장 큰 구조 차이)
+    # 2. Y0 현금 구조
+    # 3. Sculpted Debt
+    # 4. NOL 상쇄 (마지막, 세금 효과)
+    
+    # ─── Factor 1: Partnership Flip 25.5/7 → 99/5 ───
+    step1 = dict(current)
+    step1['pre_flip_cash_te'] = 99
+    step1['post_flip_cash_te'] = 5
+    step1['depr_share_pre'] = 0.01
+    step1['depr_share_post'] = 0.95
+    step1.pop('depr_share', None)
+    irr1 = _get_irr(step1)
+    delta1 = irr1 - current_irr
+    factors.append({
+        'name_ko': 'Partnership Flip 구조 (25/7 → 99/5)',
+        'name_en': 'Partnership Flip Structure (25/7 → 99/5)',
+        'delta_pp': round(delta1, 2),
+        'from_calib': '25.5/7 (Neptune Pay-Go 추정)',
+        'to_predict': '99/5 (표준 Yield-Based Flip)',
+        'explain_ko': 'Neptune은 pre-flip cash를 TE 25.5% / Sponsor 74.5%로 배분 (Pay-Go 또는 hybrid 구조 추정). Prediction은 표준 99/5 flip으로 pre-flip Sponsor 현금이 1%로 줄어듦.',
+        'explain_en': 'Neptune allocates pre-flip cash as TE 25.5% / Sponsor 74.5% (likely Pay-Go or hybrid). Prediction uses standard 99/5 flip, reducing pre-flip Sponsor cash to just 1%.',
+        'excel_hint_ko': 'Excel Partnership Flip 탭에서 pre-flip cash split 확인. 표준 99/1 아니면 Pay-Go 구조인지 또는 별도 hybrid 로직인지 문서화 필요.',
+        'excel_hint_en': 'Check Partnership Flip tab for pre-flip cash split. If not standard 99/1, document whether Pay-Go or hybrid.',
+    })
+    current = step1
+    current_irr = irr1
+    
+    # ─── Factor 2: Y0 현금 구조 (Construction ≠ FMV) ───
+    step2 = dict(current)
+    step2['calibration_mode'] = 'prediction'
+    for k in ['construction_cost_m', 'txn_costs_m', 'cap_interest_m',
+              'debt_drawdown_ratio', 'te_proceeds_ratio']:
+        step2.pop(k, None)
+    # 단, NOL과 Debt는 유지 (뒤에서 순차 해제)
+    step2['use_nol_offset'] = current.get('use_nol_offset', True)
+    step2['use_sculpted_debt'] = current.get('use_sculpted_debt', True)
+    irr2 = _get_irr(step2)
+    delta2 = irr2 - current_irr
+    factors.append({
+        'name_ko': 'Y0 현금 구조 (Construction ≠ FMV)',
+        'name_en': 'Y0 Cash Structure (Construction ≠ FMV)',
+        'delta_pp': round(delta2, 2),
+        'from_calib': 'Construction + Txn + CapInt - Debt draw - TE proceeds',
+        'to_predict': 'Sponsor Equity 전액 Y0 지출',
+        'explain_ko': 'Neptune은 Y0에 Construction Cost $640M (FMV $837M 아님) + Txn Cost $10.6M + Cap Interest $14.3M 지출, Debt 77.5% / TE 93.5%만 drawdown. 나머지는 후속 기간에 drawdown. Prediction은 전액 Y0.',
+        'explain_en': 'Neptune Y0 uses Construction Cost $640M (not FMV $837M) + Txn $10.6M + Cap Interest $14.3M, with Debt 77.5% / TE 93.5% drawn. Rest drawn later. Prediction uses full drawdown at Y0.',
+        'excel_hint_ko': 'Excel Sources & Uses 탭에서 Y0 Debt/TE drawdown 비율 확인. 전체 Debt 대비 construction 기간 drawdown 비율이 77.5%인지 검증.',
+        'excel_hint_en': 'Check Sources & Uses tab for Y0 Debt/TE drawdown ratios. Verify if construction-period drawdown is 77.5% of total Debt.',
+    })
+    current = step2
+    current_irr = irr2
+    
+    # ─── Factor 3: Sculpted Debt 해제 ───
+    step3 = dict(current)
+    step3['use_sculpted_debt'] = False
+    irr3 = _get_irr(step3)
+    delta3 = irr3 - current_irr
+    factors.append({
+        'name_ko': 'Sculpted Debt (DSCR 기반)',
+        'name_en': 'Sculpted Debt (DSCR-based)',
+        'delta_pp': round(delta3, 2),
+        'from_calib': 'DSCR 1.30 맞춤형 상환',
+        'to_predict': '균등 amortization',
+        'explain_ko': 'Neptune은 각 연도 DSCR 1.30 맞추기 위해 상환 금액을 동적으로 조정 (Sculpted). Prediction은 균등 상환으로 초기 DSCR이 낮고 후반 높음.',
+        'explain_en': 'Neptune dynamically adjusts principal to maintain DSCR 1.30 (Sculpted). Prediction uses level amortization—lower DSCR upfront, higher later.',
+        'excel_hint_ko': 'Excel Debt 탭 상환 스케줄이 DSCR 기반 sculpted인지 확인. R161~R180 부근의 IF(DSCR...) 수식.',
+        'excel_hint_en': 'Verify Debt tab amortization schedule is DSCR-based sculpted. Check IF(DSCR...) formulas near R161-R180.',
+    })
+    current = step3
+    current_irr = irr3
+    
+    # ─── Factor 4: NOL 상쇄 해제 ───
+    step4 = dict(current)
+    step4['use_nol_offset'] = False
+    irr4 = _get_irr(step4)
+    delta4 = irr4 - current_irr
+    factors.append({
+        'name_ko': 'NOL 상쇄 (Y1~Y9 Tax 상쇄)',
+        'name_en': 'NOL Offset (Y1~Y9 Tax offset)',
+        'delta_pp': round(delta4, 2),
+        'from_calib': 'Y1-Y9 Sponsor tax = $0',
+        'to_predict': 'Sponsor tax = MACRS × share',
+        'explain_ko': 'Neptune은 NOL 이월로 Y1~Y9 Partnership tax를 상쇄. Prediction은 MACRS tax benefit이 정상적으로 Sponsor에게 귀속.',
+        'explain_en': 'Neptune offsets Y1~Y9 Partnership tax via NOL carryforward. Prediction allocates MACRS tax benefit normally to Sponsor.',
+        'excel_hint_ko': 'Excel에서 NOL carryforward 로직이 MACRS benefit을 과도하게 소진하는지 확인. IRS 80% 규칙 적용 여부.',
+        'excel_hint_en': 'Verify NOL carryforward in Excel is not over-consuming MACRS benefit. Check IRS 80% limitation.',
+    })
+    
+    return {
+        'calib_irr': round(calib_irr, 2),
+        'predict_irr': round(predict_irr, 2),
+        'total_delta': round(total_delta, 2),
+        'factors': factors,
+        'note_ko': '각 요인은 Calibration 상태에서 순차적으로 해제한 기여도. 순서에 따라 값이 조금씩 달라질 수 있음 (상호작용 효과).',
+        'note_en': 'Each factor is measured by sequentially disabling from Calibration state. Values may vary slightly by order (interaction effects).',
+    }
+
+
+class DecomposeIRRRequest(BaseModel):
+    project_id: str = ""
+    inputs: dict
+
+@app.post("/valuation/decompose-irr")
+def decompose_irr(req: DecomposeIRRRequest, user=Depends(get_current_user)):
+    """Calibration vs Prediction IRR 차이를 4개 요인별로 분해"""
+    try:
+        result = _decompose_irr_difference(req.inputs)
+        return {"ok": True, "project_id": req.project_id, "result": result}
+    except Exception as e:
+        raise HTTPException(500, f"Decomposition error: {str(e)}")
+
+
+class ExplainDiffRequest(BaseModel):
+    project_id: str = ""
+    decomposition: dict  # _decompose_irr_difference 결과
+    lang: str = 'ko'
+
+@app.post("/valuation/explain-diff")
+def explain_diff(req: ExplainDiffRequest, user=Depends(get_current_user)):
+    """Claude API로 IRR 차이에 대한 자연어 해설 + 엑셀 수정 제안"""
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        
+        d = req.decomposition
+        lang = req.lang
+        
+        # 프롬프트 구성 (결정적 숫자를 context로 제공 → 환각 방지)
+        if lang == 'en':
+            system_prompt = """You are a PF (Project Finance) Solar+BESS expert. 
+Based on the decomposition data provided, explain why Calibration IRR differs from Prediction IRR 
+and suggest specific Excel modifications. Be concise, practical, and cite actual numbers. 
+Max 5 paragraphs. Do not invent data not in context."""
+            user_prompt = f"""
+Calibration IRR: {d['calib_irr']}%
+Prediction IRR: {d['predict_irr']}%
+Total Difference: {d['total_delta']}%p
+
+Factor Breakdown:
+"""
+            for f in d['factors']:
+                user_prompt += f"\n• {f['name_en']}: {f['delta_pp']:+.2f}%p\n  From (Calib): {f['from_calib']}\n  To (Predict): {f['to_predict']}\n  Excel hint: {f['excel_hint_en']}\n"
+            user_prompt += "\nExplain the key drivers of the difference and what the Excel modeler should verify/modify in their spreadsheet. Focus on actionable Excel-level advice."
+        else:
+            system_prompt = """당신은 PF (Project Finance) Solar+BESS 전문가입니다.
+제공된 분해 데이터를 바탕으로 Calibration IRR과 Prediction IRR 차이의 원인을 설명하고, 
+구체적인 엑셀 수정 제안을 해주세요. 간결하고 실용적으로, 실제 수치를 인용하세요.
+최대 5문단. context에 없는 데이터를 지어내지 마세요."""
+            user_prompt = f"""
+Calibration IRR: {d['calib_irr']}%
+Prediction IRR: {d['predict_irr']}%
+총 차이: {d['total_delta']:+.2f}%p
+
+요인별 분해:
+"""
+            for f in d['factors']:
+                user_prompt += f"\n• {f['name_ko']}: {f['delta_pp']:+.2f}%p\n  Calib → : {f['from_calib']}\n  Predict → : {f['to_predict']}\n  Excel 힌트: {f['excel_hint_ko']}\n"
+            user_prompt += "\n이 차이의 핵심 원인을 설명하고, 엑셀 모델러가 스프레드시트에서 확인/수정해야 할 사항을 알려주세요. 실행 가능한 엑셀 레벨 조언에 집중."
+        
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}]
+        )
+        
+        explanation = response.content[0].text if response.content else ""
+        return {"ok": True, "explanation": explanation, "lang": lang}
+    except Exception as e:
+        raise HTTPException(500, f"Explain error: {str(e)}")
+
+
 # ── Break-Even Analysis (Newton-Raphson) ─────────
 class BreakEvenRequest(BaseModel):
     project_id: str = ""
