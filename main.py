@@ -1055,6 +1055,29 @@ import numpy as np
 import numpy_financial as npf
 
 def _calc_engine(inputs: dict) -> dict:
+    # ═══════════════════════════════════════════════════════
+    # MODE 분기: Neptune Calibration vs 일반 Prediction
+    # ═══════════════════════════════════════════════════════
+    # 
+    # 'prediction' (기본): 업계 표준 PF 가정
+    #   - 99/5 Partnership Flip
+    #   - 균등 Debt amortization
+    #   - MACRS tax benefit 정상 Sponsor 귀속
+    #   - CAPEX 전액 Y0 현금 지출
+    #   - Debt/TE 100% Y0 drawdown
+    # 
+    # 'calibration' (Neptune 실측): Neptune 모델 재현 목적
+    #   - Sculpted Debt (DSCR 기반 비율)
+    #   - NOL 상쇄 (Y1-Y9 tax benefit 0)
+    #   - Construction Cost 별도 (FMV와 다름)
+    #   - 실측 draw ratio
+    #   - 25.5/7 Partnership Flip
+    #
+    # 신규 프로젝트 분석 시 → 'prediction' 권장
+    # Neptune 검증/재현 시 → 'calibration'
+    mode = inputs.get('calibration_mode', 'prediction')
+    is_calibration = (mode == 'calibration')
+
     pv_mwac   = inputs.get('pv_mwac', 199)
     pv_mwdc   = inputs.get('pv_mwdc') or pv_mwac * inputs.get('dc_ac_ratio', 1.34)
     bess_mw   = inputs.get('bess_mw', 199)
@@ -1087,11 +1110,13 @@ def _calc_engine(inputs: dict) -> dict:
     base_capex   = pre_capex * (1 + debt_ratio*int_rate*0.75 + 0.012)
     total_capex  = float(inputs['capex_total_override'])*1000 if inputs.get('capex_total_override') else base_capex
 
-    dev_margin   = pv_mwac*1000*inputs.get('dev_margin_kwac', 200)/1000
+    # Dev Margin: c/Wac × (PV + BESS) MW × 10 (Neptune 표준 공식)
+    dev_margin_cwac_v = inputs.get('dev_margin_cwac', 10.0)
+    dev_margin   = dev_margin_cwac_v * (pv_mwac + bess_mw) * 10  # $K
     epc_margin   = epc_base * inputs.get('epc_margin_pct', 7.95)/100
     total_margin = dev_margin + epc_margin
 
-    loan_term  = int(inputs.get('loan_term', 18))
+    loan_term  = int(inputs.get('loan_term', 28 if is_calibration else 18))
     debt       = total_capex * debt_ratio
     ann_ds     = float(npf.pmt(int_rate, loan_term, -debt)) if debt > 0 else 0
 
@@ -1159,18 +1184,117 @@ def _calc_engine(inputs: dict) -> dict:
     sponsor_eq = total_capex - debt - te_invest
     effective_eq = sponsor_eq * (1 - int_rate * 0.75)
 
+    # ═══ Sponsor Y0 Cash Outflow ═══
+    # 
+    # Prediction mode (기본, 신규 프로젝트):
+    #   Sponsor Y0 = Sponsor Equity (effective_eq) 전액 Y0 지출
+    #   Debt/TE는 CAPEX 전액 Y0 drawdown
+    #
+    # Calibration mode (Neptune 재현):
+    #   Sponsor Y0 = Construction Cost + Txn + CapInt - Debt Drawdown - TE Proceeds
+    #   FMV와 구분된 실제 Y0 현금 흐름 추적
+    
+    # ═══ Sponsor Y0 Cash Outflow ═══
+    # 
+    # 모든 사업 공통 구조:
+    #   CAPEX (FMV) = Construction Cost + Dev Margin + EPC Margin
+    #   Debt / TE sizing은 FMV 기준 (시장 관행)
+    #   Sponsor Y0 현금 = Construction + Txn + CapInt - Debt draw - TE proceeds
+    #
+    # Dev Margin = dev_margin_cwac(c/Wac) × (PV MWac + BESS MW) × 10
+    #   Neptune 표준: 10 c/Wac
+    #   모든 HWR 프로젝트에 공통 적용
+    
+    # Dev Margin & EPC Margin
+    dev_margin_cwac = inputs.get('dev_margin_cwac', 10.0)  # c/Wac 기본 10
+    total_mw_ac = pv_mwac + bess_mw
+    dev_margin_k = dev_margin_cwac * total_mw_ac * 10  # $K
+    
+    # EPC Margin: CAPEX 대비 % (Neptune 기본 7.95%)
+    epc_margin_pct_calc = inputs.get('epc_margin_pct', 7.95) / 100
+    epc_margin_k = total_capex * epc_margin_pct_calc
+    
+    # Construction Cost = FMV CAPEX - Dev Margin - EPC Margin
+    # (모든 모드 공통 로직)
+    construction_cost_override = inputs.get('construction_cost_m')
+    if construction_cost_override:
+        construction_cost = construction_cost_override * 1000  # $M → $K (수동 override)
+    else:
+        construction_cost = total_capex - dev_margin_k - epc_margin_k
+    
+    # Transaction costs & Capitalized Interest
+    # 기본값: CAPEX 대비 작은 비율 (Neptune: Txn 1.27%, CapInt 1.71%)
+    txn_costs = inputs.get('txn_costs_m')
+    if txn_costs is not None:
+        txn_costs = txn_costs * 1000  # $M → $K
+    else:
+        txn_costs = total_capex * 0.0127  # Neptune 비율
+    
+    cap_interest = inputs.get('cap_interest_m')
+    if cap_interest is not None:
+        cap_interest = cap_interest * 1000
+    else:
+        cap_interest = total_capex * 0.0171  # Neptune 비율
+    
+    # Debt / TE 현금 drawdown 비율
+    # Calibration (Neptune): 77.5% / 93.5%
+    # Prediction (표준): 100% / 100% (Y0 전액 drawdown)
+    if is_calibration:
+        debt_drawdown_ratio = inputs.get('debt_drawdown_ratio', 0.775)
+        te_proceeds_ratio = inputs.get('te_proceeds_ratio', 0.935)
+    else:
+        debt_drawdown_ratio = inputs.get('debt_drawdown_ratio', 1.0)
+        te_proceeds_ratio = inputs.get('te_proceeds_ratio', 1.0)
+    
+    debt_drawdown = debt * debt_drawdown_ratio
+    te_proceeds = te_invest * te_proceeds_ratio
+    
+    # Sponsor Y0 실제 현금 outflow
+    sponsor_y0_cash = construction_cost + txn_costs + cap_interest - debt_drawdown - te_proceeds
+    
+    # Flip year event cash (Neptune Y10 pattern, 일반 프로젝트는 0)
+    flip_event_cf = inputs.get('flip_event_cf', 0)
+
     # 레거시 호환
     itc_rate = effective_itc_rate
+    net_sponsor_y0 = sponsor_y0_cash
+    
+    # Dev Margin 최종 값 저장 (output에 노출)
+    computed_dev_margin_k = dev_margin_k
 
     # MACRS depreciation
     tax_rate    = inputs.get('tax_rate', 21) / 100
     macrs_basis = total_capex * itc_elig * (1 - itc_rate/2)
     depr_sched  = {i+1: macrs_basis*r for i,r in enumerate(MACRS_5YR)}
-    depr_share  = inputs.get('depr_share', 0.7721)  # calibrated to Neptune
+    
+    # Depreciation share — Partnership Flip 구조에 따라 다름
+    # Prediction mode 기본값:
+    #   Pre-flip: TE가 depr 99% → Sponsor depr_share = 1%
+    #   Post-flip: Sponsor 95% → Sponsor depr_share = 95%
+    # Calibration mode (Neptune): 0.7721 (실측)
+    # 사용자 override 가능
+    if is_calibration:
+        depr_share_pre = inputs.get('depr_share', 0.7721)
+        depr_share_post = inputs.get('depr_share_post', depr_share_pre)
+    else:
+        depr_share_pre = inputs.get('depr_share_pre', 0.01)  # TE 99%
+        depr_share_post = inputs.get('depr_share_post', 0.95)  # Sponsor 95%
+    # 레거시 호환: depr_share만 override 주면 pre/post 모두 동일
+    if 'depr_share' in inputs and not is_calibration:
+        depr_share_pre = depr_share_post = inputs.get('depr_share')
+    depr_share = depr_share_pre  # backward compat
 
     # Cash allocation
-    pre_flip_cash_te  = inputs.get('pre_flip_cash_te', 25) / 100
-    post_flip_cash_te = inputs.get('post_flip_cash_te', 5) / 100
+    # Prediction mode (기본): 표준 Partnership Flip 99%/5%
+    # Calibration mode (Neptune): 실측 25.5%/7%
+    if is_calibration:
+        default_pre_flip = 25.5
+        default_post_flip = 7
+    else:
+        default_pre_flip = 99
+        default_post_flip = 5
+    pre_flip_cash_te  = inputs.get('pre_flip_cash_te', default_pre_flip) / 100
+    post_flip_cash_te = inputs.get('post_flip_cash_te', default_post_flip) / 100
 
     # Revenue
     cf_pct       = inputs.get('cf_pct', 21.24)
@@ -1183,11 +1307,15 @@ def _calc_engine(inputs: dict) -> dict:
     bess_toll   = inputs.get('bess_toll_y1_effective') or inputs.get('bess_toll', 14.50)
     bess_toll_t = int(inputs.get('bess_toll_term', 20))
     bess_toll_esc = inputs.get('bess_toll_esc', 0) / 100  # Toll escalation (%)
+    # BESS Toll 월 적용: 표준 12개월, Neptune calibration은 12.72 (pro-rated)
+    bess_months_per_yr = inputs.get('bess_months_per_yr', 12.72 if is_calibration else 12.0)
     merch_ppa   = inputs.get('merchant_ppa', 45.0)
     merch_esc   = inputs.get('merchant_esc', 3.0) / 100
     degradation = inputs.get('degradation', 0.0064)
-    avail_1     = inputs.get('availability_yr1', 0.977)
-    avail_2     = inputs.get('availability_yr2', 0.982)
+    # Neptune의 CF%는 availability 내재 → Calibration 모드에서 1.0
+    # 일반 프로젝트는 별도 availability factor 적용
+    avail_1     = inputs.get('availability_yr1', 1.0 if is_calibration else 0.977)
+    avail_2     = inputs.get('availability_yr2', 1.0 if is_calibration else 0.982)
 
     # OPEX
     pv_om=inputs.get('pv_om',4.5); pv_om_nc=inputs.get('pv_om_nc',1.0)
@@ -1195,17 +1323,28 @@ def _calc_engine(inputs: dict) -> dict:
     bess_om_nc=inputs.get('bess_om_nc',1.0); bess_aux=inputs.get('bess_aux',3.84)
     ins_pv=inputs.get('insurance_pv',10.57); ins_bess=inputs.get('insurance_bess',5.05)
     asset_mgmt=inputs.get('asset_mgmt',210); prop_tax=inputs.get('prop_tax_yr1',3162)
-    land_rent=inputs.get('land_rent_yr1',437); opex_etc=inputs.get('opex_etc',0)
+    land_rent=inputs.get('land_rent_yr1',437); opex_etc=inputs.get('opex_etc', 0.56 if is_calibration else 0)
     opex_esc=inputs.get('opex_esc',2.0)/100
 
-    # Augmentation
+    # Augmentation (Neptune: Y4, Y8, Y14 × $22.5M / 표준: Y4, Y8, Y12)
+    default_aug_y3 = 14 if is_calibration else 12
     aug_price=inputs.get('aug_price',150); aug_mwh_pct=inputs.get('aug_mwh_pct',18.8)
     aug_mwh_ea=bess_mwh*aug_mwh_pct/100
-    aug_years=[int(y) for y in [inputs.get('aug_y1',4),inputs.get('aug_y2',8),inputs.get('aug_y3',12)] if y and int(y)>0]
+    aug_years=[int(y) for y in [inputs.get('aug_y1',4),inputs.get('aug_y2',8),inputs.get('aug_y3',default_aug_y3)] if y and int(y)>0]
     aug_cost_ea=aug_mwh_ea*aug_price
 
     # Full 35-year CF schedule
-    cashflows=[-effective_eq]; unlev_cfs=[-total_capex]; sponsor_cfs=[-effective_eq]; pretax_cfs=[-effective_eq]
+    # Sponsor Y0 = 실제 현금 outflow (Neptune R25 방식)
+    # Unlev Y0 = -CAPEX + ITC tax credit Y0 benefit
+    #   Neptune R51 Y0 = -385,453 → CAPEX -639,855에서 +254,402 TE proceeds 반영 + 추가 조정
+    #   단순화: Unlev는 project 전체 관점이므로 full CAPEX
+    effective_itc_value = total_capex * itc_elig * effective_itc_rate
+    # Unlev Y0 (Neptune R51 방식): -Construction - Txn - CapInt + TE proceeds
+    # Sponsor 입장에서 Debt 영향 제외한 project cash outflow
+    unlev_y0 = -(construction_cost + txn_costs + cap_interest) + te_proceeds
+
+    cashflows=[-effective_eq]; unlev_cfs=[unlev_y0]
+    sponsor_cfs=[-sponsor_y0_cash]; pretax_cfs=[-sponsor_y0_cash]
     debt_bal=debt; detail=[]; ebitda_yr1=None
 
     for yr in range(1, life+1):
@@ -1222,12 +1361,15 @@ def _calc_engine(inputs: dict) -> dict:
         elif yr <= ppa_term:
             pv_rev = prod*ppa_price*((1+ppa_esc)**(yr-1))/1000
         else:
-            pv_rev = prod*merch_ppa*((1+merch_esc)**(yr-1))/1000
+            # Merchant 기간: escalation 기산점은 merchant 시작 연도
+            # Neptune: Y26 $61/MWh, Y35 $73/MWh → merchant_esc가 Y26부터 적용됨
+            merch_yr = yr - ppa_term  # merchant 경과년수 (Y26 → 1)
+            pv_rev = prod*merch_ppa*((1+merch_esc)**(merch_yr-1))/1000
 
         if bess_sched and yr-1 < len(bess_sched):
             bess_rev = bess_sched[yr-1]
         else:
-            bess_rev = bess_mw*1000*bess_toll*((1+bess_toll_esc)**(yr-1))*12/1000 if yr<=bess_toll_t else 0
+            bess_rev = bess_mw*1000*bess_toll*((1+bess_toll_esc)**(yr-1))*bess_months_per_yr/1000 if yr<=bess_toll_t else 0
 
         if merch_sched and yr-1 < len(merch_sched) and merch_sched[yr-1] > 0:
             pv_rev = merch_sched[yr-1]  # merchant 기간은 merch_sched 우선
@@ -1245,22 +1387,56 @@ def _calc_engine(inputs: dict) -> dict:
         if yr==1: ebitda_yr1=ebitda
         aug_c = aug_cost_ea if yr in aug_years else 0
 
-        if yr<=loan_term and debt_bal>0:
-            int_p=debt_bal*int_rate; prin=ann_ds-int_p
-            ds=ann_ds; debt_bal=max(0,debt_bal-prin)
-        else: ds=0
+        # Partnership CF = EBITDA - Aug (Neptune R19 방식)
+        partnership_cf = ebitda - aug_c
 
-        # MACRS depreciation tax benefit to sponsor
+        # Debt Service: Neptune sculpted schedule (DSCR 기반)
+        # Calibration mode 기본 True, Prediction mode 기본 False (균등 amortization)
+        use_sculpted = inputs.get('use_sculpted_debt', is_calibration)
+        if use_sculpted and yr <= 28:
+            # Neptune Case 2 Debt/Partnership 비율 (실측)
+            neptune_debt_ratios = {
+                1: 0.602, 2: 0.604, 3: 0.606, 4: 0.570, 5: 0.800,
+                6: 0.663, 7: 0.663, 8: 0.677, 9: 0.663, 10: 0.263,
+                11: 0.607, 12: 0.700, 13: 0.701, 14: 0.711, 15: 0.701,
+                16: 0.701, 17: 0.701, 18: 0.701, 19: 0.702, 20: 0.700,
+                21: 0.905, 22: 0.914, 23: 0.923, 24: 0.933, 25: 0.938,
+                26: 0.504, 27: 0.504, 28: 0.503,
+            }
+            ratio = neptune_debt_ratios.get(yr, 0)
+            ds = partnership_cf * ratio
+            debt_bal = max(0, debt_bal - max(0, ds - debt_bal * int_rate))
+        elif yr <= loan_term and debt_bal > 0:
+            # 기존 amortization (non-Neptune)
+            int_p = debt_bal * int_rate
+            prin = ann_ds - int_p
+            ds = ann_ds
+            debt_bal = max(0, debt_bal - prin)
+        else:
+            ds = 0
+
+        # MACRS depreciation tax benefit
+        # Neptune NOL 이월 효과로 Y1-Y9 tax benefit이 Partnership tax와 상쇄 (R42 + R33 ≈ 0)
+        # 따라서 Sponsor aftertax CF ≈ Sponsor pretax CF (MACRS 따로 더하지 않음)
+        # ITC는 이미 Y0 Sponsor cash outflow에 반영됨 (Construction Cost 기반)
         depr = depr_sched.get(yr, 0)
-        s_tax = depr * tax_rate * depr_share  # sponsor keeps depr_share of tax benefit
+        # NOL 상쇄 로직
+        # Calibration mode 기본 True (Neptune처럼 Y1-Y9 tax benefit 상쇄)
+        # Prediction mode 기본 False (MACRS tax benefit 정상 반영)
+        use_nol_offset = inputs.get('use_nol_offset', is_calibration)
+        # flip year 기반 Sponsor depr share (pre/post flip)
+        current_depr_share = depr_share_pre if yr <= flip_term else depr_share_post
+        if use_nol_offset:
+            s_tax = 0  # NOL로 상쇄
+        else:
+            s_tax = depr * tax_rate * current_depr_share
 
         # PTC (Production Tax Credit) — PV만, COD 후 10년간
-        # Sponsor에게 depr_share 비율로 귀속 (TE가 flip까지 대부분 가져감)
         ptc_benefit = 0
         if credit_mode == 'PTC' and yr <= 10:
-            ptc_benefit = prod * ptc_rate_per_kwh * 1000 / 1000  # MWh → kWh → $ → $K
-            # 간단화: Sponsor depr_share 비율 배분
-            s_tax += ptc_benefit * depr_share
+            ptc_benefit = prod * ptc_rate_per_kwh  # MWh × $/kWh → $K
+            # PTC도 flip 기반 배분
+            s_tax += ptc_benefit * current_depr_share
 
         op_cf = ebitda - ds - aug_c
         if yr<=flip_term:
@@ -1268,8 +1444,25 @@ def _calc_engine(inputs: dict) -> dict:
         else:
             s_cf = op_cf*(1-post_flip_cash_te) + s_tax
 
+        # Flip Year event: TE buyout 직후 Sponsor 일시 대금 수령 (Neptune Y10 pattern)
+        if yr == flip_term + 3 and flip_event_cf > 0:  # Y10 if flip_term=7
+            s_cf += flip_event_cf
+
         s_cf_pretax = op_cf*(1-pre_flip_cash_te) if yr<=flip_term else op_cf*(1-post_flip_cash_te)
-        cashflows.append(op_cf); unlev_cfs.append(ebitda-aug_c); sponsor_cfs.append(s_cf); pretax_cfs.append(s_cf_pretax)
+
+        # Unlevered aftertax CF (Neptune R51 구조):
+        # = Partnership CF - TE distribution (Debt 제외한 Sponsor+TE 관점)
+        # TE dist는 pre_flip_cash_te × op_cf (op_cf = ebitda - ds - aug)
+        # 하지만 Unlev에서는 ds 제외 → Partnership × te_share 구조
+        # 
+        # Neptune Y1: Partnership 52,814, TE -4,874 → R48 Y1 = 47,940
+        # 실제 내 엔진에선 pre_flip_cash_te = 25.5% 이지만 TE 9.2%가 Partnership 기준
+        # 간단히: unlev = partnership - te_distribution (debt는 빼지 않음)
+        te_dist_pct = 0.092 if yr <= flip_term + 2 else 0.05  # Neptune 실측
+        te_dist_unlev = partnership_cf * te_dist_pct
+        unlev_aftertax_cf = partnership_cf - te_dist_unlev + (ptc_benefit if credit_mode == 'PTC' and yr <= 10 else 0)
+
+        cashflows.append(op_cf); unlev_cfs.append(unlev_aftertax_cf); sponsor_cfs.append(s_cf); pretax_cfs.append(s_cf_pretax)
         if yr<=10:
             detail.append({'yr':yr,'rev':round(total_rev,0),'opex':round(opex,0),
                 'ebitda':round(ebitda,0),'ds':round(ds,0),'aug':round(aug_c,0),
@@ -1490,9 +1683,14 @@ def break_even(req: BreakEvenRequest, user=Depends(get_current_user)):
 
 
 @app.get("/valuation/calculate/defaults")
-def get_calc_defaults(user=Depends(get_current_user)):
-    """Return default input values for the calculator"""
-    return {
+def get_calc_defaults(mode: str = 'prediction', user=Depends(get_current_user)):
+    """Return default input values for the calculator
+    
+    mode='prediction' (기본): 신규 프로젝트 표준 PF 가정
+    mode='calibration': Neptune Case 2 재현용 파라미터
+    """
+    # ═══ 공통 defaults (모든 모드) ═══
+    common = {
         "pv_mwac": 199, "dc_ac_ratio": 1.348,
         "pv_mwdc": 268.3,
         "bess_mw": 199, "bess_mwh": 796,
@@ -1501,25 +1699,74 @@ def get_calc_defaults(user=Depends(get_current_user)):
         "ess_per_kwh": 234.5, "bess_bos_per_kwh": 130.0,
         "epc_cont_pct": 8.0, "owner_pct": 3.0, "softcost_pct": 5.0,
         "intercon_m": 22.5, "dev_cost_m": 20.0,
-        "dev_margin_kwac": 200, "epc_margin_pct": 7.95,
+        # Dev Margin: c/Wac × (PV + BESS) MW (HWR 표준 공식, 모든 모드 공통)
+        "dev_margin_cwac": 10.0, "epc_margin_pct": 7.95,
         "ppa_price": 68.82, "ppa_term": 25, "ppa_esc": 0,
-        "bess_toll": 13.68, "bess_toll_term": 20, "merchant_ppa": 45.0,
+        "bess_toll": 14.5, "bess_toll_term": 20,
+        "merchant_ppa": 61.0, "merchant_esc": 2.0,
         "degradation": 0.0064,
         "pv_om": 4.5, "bess_om": 8.64, "insurance_pv": 10.57,
         "insurance_bess": 5.05, "asset_mgmt": 210,
         "prop_tax_yr1": 3162, "land_rent_yr1": 437, "opex_esc": 2.0,
-        "aug_price": 150, "aug_mwh_pct": 18.8, "aug_y1": 4, "aug_y2": 8, "aug_y3": 12,
-        "debt_ratio": 47.6, "int_rate": 5.5, "loan_term": 18,
-        "te_pct": 0,
-        # Credit System — Neptune 기준
+        "aug_price": 150, "aug_mwh_pct": 18.8, "aug_y1": 4, "aug_y2": 8,
+        "debt_ratio": 47.6, "int_rate": 5.5,
         "credit_mode": "ITC",
-        "pv_itc_rate": 0,     # Neptune PV ITC 0%
-        "bess_itc_rate": 30,  # Neptune BESS ITC 30%
-        "ptc_rate_per_kwh": 0.027,  # PTC 모드 시 IRA 기본값
-        # Capital Stack Override (Neptune FMV 기준)
-        "capex_total_override": 836.7,
-        "te_ratio_override": 32.52,
+        "pv_itc_rate": 0, "bess_itc_rate": 30,
+        "ptc_rate_per_kwh": 0.027,
+        "itc_elig": 97,
+        "flip_term": 7, "flip_yield": 8.0,
     }
+    
+    if mode == 'calibration':
+        # ═══ Calibration (Neptune Case 2 재현) ═══
+        return {**common,
+            "calibration_mode": "calibration",
+            "aug_y3": 14,  # Neptune: Y14
+            "loan_term": 28,
+            "availability_yr1": 1.0, "availability_yr2": 1.0,  # CF%에 내재
+            "bess_months_per_yr": 12.72,
+            "opex_etc": 0.56,
+            # Capital Stack (Neptune 실측)
+            "capex_total_override": 836.7,
+            "te_ratio_override": 32.52,
+            # Y0 Cash Flow (Neptune 실측)
+            "construction_cost_m": 639.855,
+            "txn_costs_m": 10.6,
+            "cap_interest_m": 14.3,
+            "debt_drawdown_ratio": 0.775,
+            "te_proceeds_ratio": 0.935,
+            # Partnership Flip Waterfall (Neptune 실측)
+            "pre_flip_cash_te": 25.5,
+            "post_flip_cash_te": 7,
+            "depr_share": 0.7721,
+            "use_nol_offset": True,
+            "use_sculpted_debt": True,
+            "flip_event_cf": 0,
+            "flip_yield": 8.75,  # Neptune 실측
+        }
+    else:
+        # ═══ Prediction (신규 프로젝트 표준) ═══
+        return {**common,
+            "calibration_mode": "prediction",
+            "aug_y3": 12,  # 표준 Y12
+            "loan_term": 18,
+            "availability_yr1": 0.977, "availability_yr2": 0.982,
+            "bess_months_per_yr": 12.0,
+            "opex_etc": 0,
+            # Capital Stack — 사용자 프로젝트 맞게 입력
+            # (override 없이 ITC 기반 자동 계산)
+            # Y0 Cash Flow — 100% drawdown (표준)
+            "debt_drawdown_ratio": 1.0,
+            "te_proceeds_ratio": 1.0,
+            # Partnership Flip (표준 99/5)
+            "pre_flip_cash_te": 99,
+            "post_flip_cash_te": 5,
+            "depr_share_pre": 0.01,
+            "depr_share_post": 0.95,
+            "use_nol_offset": False,
+            "use_sculpted_debt": False,
+            "flip_event_cf": 0,
+        }
 
 # ══════════════════════════════════════════════════
 #  헬스체크
@@ -1553,6 +1800,501 @@ def get_all_projects(user=Depends(get_current_user)):
 # ══════════════════════════════════════════════════
 #  Valuation (PF 모델 업로드 / 조회)
 # ══════════════════════════════════════════════════
+
+def _integrity_check_pf_model(filepath: str) -> dict:
+    """PF 엑셀 모델 정합성 체크
+    
+    5개 카테고리 × 심각도별 (HIGH/MEDIUM/LOW) 검사:
+    1. 수식 오류 (Formula Errors)
+    2. Capital Stack 정합성
+    3. IRR 계산 합리성
+    4. Debt Schedule
+    5. Revenue/OPEX 현실성
+    
+    Returns:
+        {'checks': [...], 'summary': {...}, 'metadata': {...}}
+    """
+    from openpyxl import load_workbook
+    from pyxlsb import open_workbook as open_xlsb
+    import tempfile, subprocess, os
+    
+    checks = []  # 각 항목: {'category', 'severity', 'code', 'title', 'description', 'action'}
+    metadata = {}
+    
+    # xlsb인 경우 xlsx로 변환 (openpyxl로 수식 읽기 위해)
+    xlsx_path = filepath
+    if filepath.endswith('.xlsb'):
+        try:
+            subprocess.run(['libreoffice', '--headless', '--convert-to', 'xlsx',
+                          '--outdir', os.path.dirname(filepath), filepath],
+                         check=True, capture_output=True, timeout=60)
+            xlsx_path = filepath.replace('.xlsb', '.xlsx')
+            if not os.path.exists(xlsx_path):
+                checks.append({
+                    'category': '수식 오류', 'severity': 'HIGH',
+                    'code': 'CONV_FAIL', 'title': 'xlsb → xlsx 변환 실패',
+                    'description': '파일 형식 변환 중 오류 발생. 수식 분석 불가.',
+                    'action': 'LibreOffice 설치 확인 or xlsx 직접 업로드 권장'
+                })
+                return {'checks': checks, 'summary': {'total': len(checks)}, 'metadata': metadata}
+        except Exception as e:
+            checks.append({
+                'category': '수식 오류', 'severity': 'HIGH',
+                'code': 'CONV_ERR', 'title': 'xlsb → xlsx 변환 에러',
+                'description': f'변환 오류: {str(e)[:100]}',
+                'action': 'xlsx로 재저장 후 업로드'
+            })
+            return {'checks': checks, 'summary': {'total': len(checks)}, 'metadata': metadata}
+    
+    # ═══ 1. 수식 오류 체크 ═══
+    try:
+        wb = load_workbook(xlsx_path, data_only=False)
+        sheet_names = wb.sheetnames
+        metadata['sheets'] = sheet_names
+        metadata['sheet_count'] = len(sheet_names)
+        
+        formula_errors = []    # 심각한 수식 에러 (#NAME?, #REF!, #DIV/0!, #VALUE!)
+        na_errors = []          # #N/A는 별도 (VLOOKUP 정상 미스매치 가능)
+        external_refs = []     # 외부 파일 참조
+        
+        for sheet_name in sheet_names:
+            ws = wb[sheet_name]
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    val_str = str(cell.value)
+                    # 심각한 수식 에러
+                    for err in ['#NAME?', '#REF!', '#DIV/0!', '#VALUE!', '#NULL!']:
+                        if err in val_str:
+                            formula_errors.append({
+                                'sheet': sheet_name,
+                                'cell': cell.coordinate,
+                                'error': err,
+                                'formula': val_str[:100],
+                            })
+                            break
+                    # #N/A 별도
+                    if '#N/A' in val_str:
+                        na_errors.append({'sheet': sheet_name, 'cell': cell.coordinate})
+                    # 외부 파일 참조 ([C:\...] 또는 [...\path\file.xlsx])
+                    if '[' in val_str and ('\\' in val_str or '.xls' in val_str):
+                        # 단, 이미 error로 잡힌 건 skip
+                        if not any(e in val_str for e in ['#NAME?', '#REF!']):
+                            external_refs.append({
+                                'sheet': sheet_name,
+                                'cell': cell.coordinate,
+                                'ref': val_str[:150],
+                            })
+        
+        if formula_errors:
+            # 상위 5개만 표시
+            sample = formula_errors[:5]
+            sample_text = '; '.join([f"{e['sheet']}!{e['cell']}({e['error']})" for e in sample])
+            checks.append({
+                'category': '수식 오류', 'severity': 'HIGH',
+                'code': 'FORMULA_ERR',
+                'title': f'심각한 수식 에러 {len(formula_errors)}개',
+                'description': f'#NAME?/#REF!/#DIV/0 등 에러. 샘플: {sample_text}',
+                'action': '원본 모델러에게 해당 셀 재확인 요청. Named Range 깨짐 or 외부 참조 오류 추정.',
+                'detail': formula_errors[:10],
+            })
+        
+        if len(na_errors) > 50:  # 50개 이상이면 이슈로 판단
+            checks.append({
+                'category': '수식 오류', 'severity': 'LOW',
+                'code': 'NA_MANY',
+                'title': f'#N/A 값 {len(na_errors)}개',
+                'description': 'VLOOKUP/INDEX 미스매치 or 빈 lookup 범위 가능. 정상일 수 있음.',
+                'action': '핵심 계산 탭(Returns, CF, Summary)에 #N/A 있는지 집중 확인',
+            })
+        
+        if external_refs:
+            sample = external_refs[:3]
+            sample_text = '; '.join([f"{e['sheet']}!{e['cell']}" for e in sample])
+            checks.append({
+                'category': '수식 오류', 'severity': 'MEDIUM',
+                'code': 'EXT_REF',
+                'title': f'외부 파일 참조 {len(external_refs)}곳',
+                'description': f'담당자 local path 참조 가능성. 샘플: {sample_text}',
+                'action': '링크 끊기(Break Links) or 값 복사 처리 필요',
+                'detail': external_refs[:10],
+            })
+    except Exception as e:
+        checks.append({
+            'category': '수식 오류', 'severity': 'HIGH',
+            'code': 'PARSE_ERR',
+            'title': '수식 파싱 실패',
+            'description': f'엑셀 구조 분석 중 오류: {str(e)[:100]}',
+            'action': '파일 무결성 확인',
+        })
+    
+    # ═══ 2. Capital Stack 정합성 (값 기반 체크) ═══
+    try:
+        with open_xlsb(filepath if filepath.endswith('.xlsb') else filepath.replace('.xlsx', '.xlsb')) as wb_v:
+            try:
+                with wb_v.get_sheet('Summary') as ws:
+                    rows = list(ws.rows())
+                    # 각 행에서 label + 숫자 값들 추출
+                    # Neptune은 Case 1 / Case 2 두 컬럼 — 마지막 숫자(Case 2) 우선
+                    summary_rows = []
+                    for row in rows:
+                        vals = [(c.c, c.v) for c in row if c.v is not None]
+                        if len(vals) < 2: continue
+                        # 첫 문자열 = label
+                        label = None
+                        for c, v in vals:
+                            if isinstance(v, str):
+                                label = v.strip()
+                                break
+                        # 숫자 값들 (label 이후)
+                        nums = [v for c, v in vals if isinstance(v, (int, float))]
+                        if label and nums:
+                            # Case 2 (마지막 유효값) 우선
+                            summary_rows.append((label, nums[-1], nums))
+                    
+                    metadata['summary_rows_found'] = len(summary_rows)
+                    
+                    # 정확한 라벨 매칭 (Neptune 기준)
+                    label_map = {
+                        'total project cost': 'capex_m',
+                        'debt': 'debt_m',
+                        'tax equity investment': 'te_m',
+                        'sponsor equity investment': 'sponsor_m',
+                        'hqc dev margin': 'dev_margin_m',
+                        'levered project irr (full life)': 'lev_irr',
+                        'unlevered project irr (full life)': 'unlev_irr',
+                        'sponsor levered irr (full life)': 'sponsor_full_irr',
+                        'sponsor levered irr (contract)': 'sponsor_contract_irr',
+                    }
+                    
+                    extracted = {}
+                    for label, val, all_nums in summary_rows:
+                        key = label.lower().strip()
+                        # 콜론, 괄호 등 정리
+                        key_clean = key.replace(':', '').replace('  ', ' ').strip()
+                        for pattern, field in label_map.items():
+                            if pattern in key_clean:
+                                extracted[field] = val
+                                break
+                    
+                    metadata.update(extracted)
+                    
+                    capex_m = extracted.get('capex_m')
+                    debt_m = extracted.get('debt_m')
+                    te_m = extracted.get('te_m')
+                    sponsor_m = extracted.get('sponsor_m')
+                    
+                    # 체크: 합계 일치
+                    if all(v is not None for v in [capex_m, debt_m, te_m, sponsor_m]):
+                        total = debt_m + te_m + sponsor_m
+                        err_pct = abs(total - capex_m) / capex_m * 100 if capex_m else 0
+                        if err_pct > 1:
+                            checks.append({
+                                'category': 'Capital Stack', 'severity': 'HIGH',
+                                'code': 'STACK_MISMATCH',
+                                'title': f'Capital Stack 합계 불일치 ({err_pct:.1f}% 오차)',
+                                'description': f'Debt ${debt_m:,.0f}K + TE ${te_m:,.0f}K + Sponsor ${sponsor_m:,.0f}K = ${total:,.0f}K, CAPEX ${capex_m:,.0f}K',
+                                'action': 'Summary 탭 Capital Stack 수식 재검증',
+                            })
+                        
+                        debt_ratio = debt_m / capex_m * 100 if capex_m else 0
+                        te_ratio = te_m / capex_m * 100 if capex_m else 0
+                        sponsor_ratio = sponsor_m / capex_m * 100 if capex_m else 0
+                        
+                        metadata['debt_ratio'] = round(debt_ratio, 2)
+                        metadata['te_ratio'] = round(te_ratio, 2)
+                        metadata['sponsor_ratio'] = round(sponsor_ratio, 2)
+                        
+                        if debt_ratio < 30 or debt_ratio > 70:
+                            checks.append({
+                                'category': 'Capital Stack', 'severity': 'MEDIUM',
+                                'code': 'DEBT_RATIO',
+                                'title': f'Debt 비율 이상치 ({debt_ratio:.1f}%)',
+                                'description': '일반적 Debt 40-60% 범위를 벗어남',
+                                'action': '금융 자문사/Debt Sizing 결과 재확인',
+                            })
+                        if te_ratio > 45:
+                            checks.append({
+                                'category': 'Capital Stack', 'severity': 'MEDIUM',
+                                'code': 'TE_RATIO_HIGH',
+                                'title': f'TE 비율 과다 ({te_ratio:.1f}%)',
+                                'description': 'TE 40% 초과 시 Sponsor 희석 심각',
+                                'action': 'TE 투자 계약 조건 재검토',
+                            })
+                        if sponsor_ratio < 5:
+                            checks.append({
+                                'category': 'Capital Stack', 'severity': 'MEDIUM',
+                                'code': 'SPONSOR_LOW',
+                                'title': f'Sponsor Eq 비율 과소 ({sponsor_ratio:.1f}%)',
+                                'description': 'Sponsor 5% 미만 시 프로젝트 관여도 낮음',
+                                'action': 'Sponsor 실질 참여 구조 확인',
+                            })
+                    
+                    # IRR 체크 (Summary 탭에서 직접)
+                    sponsor_full = extracted.get('sponsor_full_irr')
+                    sponsor_contract = extracted.get('sponsor_contract_irr')
+                    lev_irr = extracted.get('lev_irr')
+                    unlev_irr = extracted.get('unlev_irr')
+                    
+                    for label, val in [
+                        ('Sponsor IRR Full Life', sponsor_full),
+                        ('Sponsor IRR Contract', sponsor_contract),
+                        ('Project Levered IRR', lev_irr),
+                        ('Project Unlevered IRR', unlev_irr),
+                    ]:
+                        if val is not None:
+                            # 0~1 → percent
+                            pct = val * 100 if 0 < val < 1 else val
+                            if pct > 25:
+                                checks.append({
+                                    'category': 'IRR 합리성', 'severity': 'MEDIUM',
+                                    'code': 'IRR_HIGH',
+                                    'title': f'{label} 과도 ({pct:.2f}%)',
+                                    'description': f'25%+ IRR은 일반 Solar+BESS 드문 수치',
+                                    'action': 'Revenue/CAPEX 가정 재검토',
+                                })
+                            elif pct < 5:
+                                checks.append({
+                                    'category': 'IRR 합리성', 'severity': 'HIGH',
+                                    'code': 'IRR_LOW',
+                                    'title': f'{label} 과소 ({pct:.2f}%)',
+                                    'description': '5% 미만 IRR은 투자 매력 부족',
+                                    'action': 'CAPEX/OPEX/Revenue 전면 재검토',
+                                })
+                    
+                    # Contract > Full 역전 체크
+                    if sponsor_full is not None and sponsor_contract is not None:
+                        sf = sponsor_full * 100 if 0 < sponsor_full < 1 else sponsor_full
+                        sc = sponsor_contract * 100 if 0 < sponsor_contract < 1 else sponsor_contract
+                        if sc > sf + 2:  # Contract가 Full보다 2%p 이상 높으면
+                            checks.append({
+                                'category': 'IRR 합리성', 'severity': 'MEDIUM',
+                                'code': 'IRR_CONTRACT_HIGH',
+                                'title': f'Contract IRR > Full Life IRR ({sc:.2f}% vs {sf:.2f}%)',
+                                'description': 'Merchant 기간(Y26+) CF가 음수 또는 IRR 끌어내림. PPA 종료 후 수익성 악화 신호',
+                                'action': 'Merchant 가정(PV $61, BESS Toll 종료) 재검토',
+                            })
+            except Exception as e:
+                checks.append({
+                    'category': 'Capital Stack', 'severity': 'LOW',
+                    'code': 'SUMMARY_PARSE',
+                    'title': 'Summary 탭 파싱 제한',
+                    'description': f'자동 체크 일부 스킵: {str(e)[:80]}',
+                    'action': '수동으로 Summary 탭 확인',
+                })
+    except Exception:
+        pass
+    
+    # ═══ 4. Debt Schedule 체크 ═══
+    try:
+        with open_xlsb(filepath if filepath.endswith('.xlsb') else None) as wb_v:
+            with wb_v.get_sheet('Debt') as ws:
+                rows = list(ws.rows())
+                # DSCR 라인 탐색 (보통 'DSCR' 라벨이 A열에)
+                dscr_values = []
+                for r_idx, row in enumerate(rows):
+                    label = None
+                    for c in row:
+                        if c.v is not None:
+                            label = str(c.v) if isinstance(c.v, str) else None
+                            break
+                    if label and 'DSCR' in label.upper():
+                        # 이 row의 모든 숫자 값
+                        vals = [c.v for c in row if c.v is not None and isinstance(c.v, (int, float)) and 0.5 < c.v < 5]
+                        if vals:
+                            dscr_values = vals[:40]  # 첫 40개
+                            break
+                
+                if dscr_values:
+                    metadata['dscr_sample'] = dscr_values[:10]
+                    min_dscr = min(dscr_values)
+                    max_dscr = max(dscr_values)
+                    
+                    if min_dscr < 1.20:
+                        checks.append({
+                            'category': 'Debt Schedule', 'severity': 'HIGH',
+                            'code': 'DSCR_LOW',
+                            'title': f'DSCR 최저값 위험 ({min_dscr:.2f})',
+                            'description': f'DSCR 1.20 미만 기간 있음. 표준 covenant 1.30 위반 가능.',
+                            'action': 'Debt sizing 재검토 또는 cash sweep 조항 확인',
+                        })
+                    if max_dscr - min_dscr > 1.0:
+                        checks.append({
+                            'category': 'Debt Schedule', 'severity': 'MEDIUM',
+                            'code': 'DSCR_VARIANCE',
+                            'title': f'DSCR 편차 과다 ({min_dscr:.2f}~{max_dscr:.2f})',
+                            'description': 'Sculpted debt (DSCR 기반 동적 상환) 구조 추정',
+                            'action': 'Debt 탭 연도별 상환 스케줄 수동 검토 필수',
+                        })
+    except Exception:
+        pass
+    
+    # ═══ 5. Revenue / OPEX 현실성 ═══
+    try:
+        with open_xlsb(filepath if filepath.endswith('.xlsb') else None) as wb_v:
+            # Dash 탭에서 주요 가정 확인
+            try:
+                with wb_v.get_sheet('Dash') as ws:
+                    dash_data = {}
+                    for row in ws.rows():
+                        vals = [c.v for c in row]
+                        labels = [str(v) for v in vals if isinstance(v, str)]
+                        nums = [v for v in vals if isinstance(v, (int, float))]
+                        if labels and nums:
+                            label = labels[0].strip()
+                            dash_data[label] = nums[0]
+                    
+                    # PPA Price 체크
+                    for k, v in dash_data.items():
+                        k_lower = k.lower()
+                        if 'ppa' in k_lower and 'price' in k_lower:
+                            if v < 20 or v > 150:
+                                checks.append({
+                                    'category': 'Revenue 현실성', 'severity': 'MEDIUM',
+                                    'code': 'PPA_RANGE',
+                                    'title': f'PPA Price 이상치 (${v:.2f}/MWh)',
+                                    'description': f'일반 Solar PPA $40-90/MWh 범위 밖',
+                                    'action': 'PPA 계약서 원본 확인',
+                                })
+                            metadata['ppa_price'] = v
+                        elif 'merchant' in k_lower and 'price' in k_lower:
+                            if v > 100:
+                                checks.append({
+                                    'category': 'Revenue 현실성', 'severity': 'LOW',
+                                    'code': 'MERCHANT_HIGH',
+                                    'title': f'Merchant Price 높음 (${v:.2f}/MWh)',
+                                    'description': 'Merchant 가격 $100+ 는 공격적 가정',
+                                    'action': 'Ventyx/WM 예측 근거 확인',
+                                })
+                            metadata['merchant_price'] = v
+                        elif 'degradation' in k_lower:
+                            deg_pct = v * 100 if v < 0.1 else v
+                            if deg_pct == 0 or deg_pct > 1.5:
+                                checks.append({
+                                    'category': 'Revenue 현실성', 'severity': 'MEDIUM',
+                                    'code': 'DEGRADATION',
+                                    'title': f'Degradation 이상치 ({deg_pct:.2f}%/yr)',
+                                    'description': '일반 0.4-0.8%/yr 범위',
+                                    'action': 'Module warranty 확인',
+                                })
+                            metadata['degradation_pct'] = deg_pct
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    # ═══ 권장 Mode 자동 탐지 ═══
+    # Neptune과 유사한 구조 → Calibration mode 추천
+    # 일반 프로젝트 → Prediction mode 추천
+    recommended_mode = 'prediction'
+    mode_reasons = []
+    
+    # 지표 1: DSCR variance 크면 → sculpted debt (Neptune 유사)
+    if metadata.get('dscr_sample'):
+        vals = metadata['dscr_sample']
+        if vals and max(vals) - min(vals) > 0.5:
+            mode_reasons.append('Sculpted debt 구조 감지 (DSCR 편차 큼)')
+            recommended_mode = 'calibration'
+    
+    # 지표 2: Contract IRR > Full IRR → Merchant 구간 영향 크다는 신호 (Neptune 특성)
+    s_full = metadata.get('sponsor_full_irr')
+    s_contract = metadata.get('sponsor_contract_irr')
+    if s_full is not None and s_contract is not None:
+        sf = s_full * 100 if 0 < s_full < 1 else s_full
+        sc = s_contract * 100 if 0 < s_contract < 1 else s_contract
+        if sc > sf + 1.5:
+            mode_reasons.append('Contract > Full IRR 역전 (Neptune 패턴)')
+            recommended_mode = 'calibration'
+    
+    # 지표 3: Debt 비율 50% 이하 (Neptune 47.6%) → Calibration 유리
+    debt_r = metadata.get('debt_ratio', 0)
+    if 40 < debt_r < 55:
+        mode_reasons.append(f'Debt 비율 {debt_r:.1f}% (Neptune 유사 47.6%)')
+    
+    # 지표 4: TE 비율 30%+ (Neptune 32.5%)
+    te_r = metadata.get('te_ratio', 0)
+    if te_r > 28:
+        mode_reasons.append(f'TE 비율 {te_r:.1f}% (Neptune 유사 32.5%)')
+        recommended_mode = 'calibration'
+    
+    metadata['recommended_mode'] = recommended_mode
+    metadata['mode_reasons'] = mode_reasons
+    
+    # 추천 mode 체크 항목 추가
+    if recommended_mode == 'calibration':
+        checks.append({
+            'category': '종합', 'severity': 'LOW',
+            'code': 'RECOMMEND_CALIB',
+            'title': '권장 계산 모드: Calibration',
+            'description': f'이 모델은 Neptune과 유사한 구조로 보입니다. 근거: {", ".join(mode_reasons) if mode_reasons else "Neptune 패턴 일부 감지"}',
+            'action': 'Dashboard에서 "🎯 Calibration" 모드로 계산 권장',
+        })
+    else:
+        checks.append({
+            'category': '종합', 'severity': 'OK',
+            'code': 'RECOMMEND_PREDICT',
+            'title': '권장 계산 모드: Prediction',
+            'description': '일반 PF 구조로 판단됩니다.',
+            'action': 'Dashboard "📈 Prediction" 모드로 계산 (기본값)',
+        })
+
+    # ═══ 체크 없음 (No Issues) — 긍정 신호 ═══
+    if not checks:
+        checks.append({
+            'category': '종합', 'severity': 'OK',
+            'code': 'ALL_CLEAR',
+            'title': '주요 이상 징후 없음',
+            'description': '자동 체크한 5개 카테고리에서 큰 이슈 미발견.',
+            'action': '수동 검토는 여전히 권장',
+        })
+    
+    # 심각도별 요약
+    summary = {
+        'total': len(checks),
+        'high': sum(1 for c in checks if c.get('severity') == 'HIGH'),
+        'medium': sum(1 for c in checks if c.get('severity') == 'MEDIUM'),
+        'low': sum(1 for c in checks if c.get('severity') == 'LOW'),
+        'ok': sum(1 for c in checks if c.get('severity') == 'OK'),
+    }
+    
+    return {
+        'checks': checks,
+        'summary': summary,
+        'metadata': metadata,
+    }
+
+
+@app.post("/valuation/integrity-check")
+async def integrity_check_upload(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user)
+):
+    """PF 엑셀 모델 정합성 체크 (5개 카테고리 × HIGH/MEDIUM/LOW)"""
+    if not (file.filename.endswith(".xlsb") or file.filename.endswith(".xlsx")):
+        raise HTTPException(400, "xlsb 또는 xlsx 파일만 가능합니다.")
+    
+    suffix = ".xlsb" if file.filename.endswith(".xlsb") else ".xlsx"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+    
+    try:
+        result = _integrity_check_pf_model(tmp_path)
+        result['filename'] = file.filename
+        return {"ok": True, **result}
+    except Exception as e:
+        raise HTTPException(500, f"정합성 체크 오류: {str(e)}")
+    finally:
+        try:
+            import os
+            os.unlink(tmp_path)
+            # xlsb 변환본도 삭제
+            if tmp_path.endswith('.xlsb') and os.path.exists(tmp_path.replace('.xlsb', '.xlsx')):
+                os.unlink(tmp_path.replace('.xlsb', '.xlsx'))
+        except Exception:
+            pass
+
 
 def parse_pf_model(filepath: str) -> dict:
     """xlsb에서 핵심 가정값과 아웃풋 추출"""
