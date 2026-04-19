@@ -14,6 +14,15 @@ Generated: Apr 19, 2026
 """
 
 import numpy as np
+import numpy_financial as npf
+
+# ═══════════════════════════════════════════════════════════════
+# 상수 (Constants)
+# ═══════════════════════════════════════════════════════════════
+
+# MACRS 5-year depreciation schedule (Solar PV + BESS 표준)
+# 5년 MACRS: 20%, 32%, 19.2%, 11.52%, 11.52%, 5.76%
+MACRS_5YR = [0.20, 0.32, 0.192, 0.1152, 0.1152, 0.0576]
 
 
 def _irr_robust(cfs, guess=0.08):
@@ -562,6 +571,13 @@ _CALIB_STRUCTURAL = {
     'flip_event_cf': 0,
 }
 # 사이드바에서 오기도 하는 파라미터 — 없을 때만 Neptune 값으로 채움
+_CALIB_FILL_IF_MISSING = {
+    'availability_yr1': 1.0,
+    'availability_yr2': 1.0,
+    'capex_total_override': 836.7,
+    'te_ratio_override': 32.52,
+    'flip_yield': 8.75,
+}
 
 def _apply_calibration_defaults(inputs: dict) -> dict:
     """calibration_mode='calibration'일 때 Neptune 구조적 파라미터 자동 주입.
