@@ -1532,11 +1532,69 @@ def _calc_engine(inputs: dict) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════
+# Calibration Auto-Merge
+# ──────────────────────────────────────────────────────────────
+# 프런트 사이드바는 Neptune 구조적 파라미터를 전송하지 않으므로,
+# calibration_mode='calibration' 일 때 백엔드가 자동 주입한다.
+# (값은 get_calc_defaults endpoint와 동일 — single source로 가려면 추후 리팩터)
+# ══════════════════════════════════════════════════════════════
+
+# 구조적 Neptune 파라미터 — calibration 모드에서 항상 이 값 사용
+# (사이드바의 prediction default를 덮어쓴다; 예: loan_term 18 → 28)
+_CALIB_STRUCTURAL = {
+    'loan_term': 28,
+    'aug_y3': 14,
+    'bess_months_per_yr': 12.72,
+    'opex_etc': 0.56,
+    'construction_cost_m': 639.855,
+    'txn_costs_m': 10.6,
+    'cap_interest_m': 14.3,
+    'debt_drawdown_ratio': 0.775,
+    'te_proceeds_ratio': 0.935,
+    'pre_flip_cash_te': 25.5,
+    'post_flip_cash_te': 7,
+    'depr_share': 0.7721,
+    'use_nol_offset': True,
+    'use_sculpted_debt': True,
+    'flip_event_cf': 0,
+}
+# 사이드바에서 오기도 하는 파라미터 — 없을 때만 Neptune 값으로 채움
+_CALIB_FILL_IF_MISSING = {
+    'availability_yr1': 1.0,
+    'availability_yr2': 1.0,
+    'capex_total_override': 836.7,
+    'te_ratio_override': 32.52,
+    'flip_yield': 8.75,
+}
+
+def _apply_calibration_defaults(inputs: dict) -> dict:
+    """calibration_mode='calibration'일 때 Neptune 구조적 파라미터 자동 주입.
+    
+    주의: _calc_engine에 직접 넣지 않는다 — _decompose_irr_difference가
+    step별로 실험적 param 변경 (예: pre_flip_cash_te 25.5→99) 할 때
+    auto-merge가 덮어쓰면 decompose가 깨진다.
+    따라서 endpoint 레벨에서만 호출한다.
+    """
+    if inputs.get('calibration_mode') != 'calibration':
+        return inputs
+    merged = dict(inputs)
+    # 구조적 파라미터는 Neptune 값 강제
+    for k, v in _CALIB_STRUCTURAL.items():
+        merged[k] = v
+    # 나머지는 fill-if-missing
+    for k, v in _CALIB_FILL_IF_MISSING.items():
+        if k not in merged or merged[k] is None:
+            merged[k] = v
+    return merged
+
+
 @app.post("/valuation/calculate")
 def calculate_valuation(req: ValuationCalcRequest, user=Depends(get_current_user)):
     """Run PF calculation engine with given inputs"""
     try:
-        result = _calc_engine(req.inputs)
+        inputs = _apply_calibration_defaults(dict(req.inputs))
+        result = _calc_engine(inputs)
         return {"ok": True, "project_id": req.project_id, "result": result}
     except Exception as e:
         raise HTTPException(500, f"Calculation error: {str(e)}")
