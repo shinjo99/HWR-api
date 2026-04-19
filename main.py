@@ -1801,24 +1801,185 @@ def get_all_projects(user=Depends(get_current_user)):
 #  Valuation (PF 모델 업로드 / 조회)
 # ══════════════════════════════════════════════════
 
-def _integrity_check_pf_model(filepath: str) -> dict:
+def _integrity_check_pf_model(filepath: str, lang: str = 'ko') -> dict:
     """PF 엑셀 모델 정합성 체크
     
-    5개 카테고리 × 심각도별 (HIGH/MEDIUM/LOW) 검사:
-    1. 수식 오류 (Formula Errors)
-    2. Capital Stack 정합성
-    3. IRR 계산 합리성
-    4. Debt Schedule
-    5. Revenue/OPEX 현실성
+    5개 카테고리 × 심각도별 (HIGH/MEDIUM/LOW) 검사
+    
+    Args:
+        filepath: 엑셀 파일 경로
+        lang: 'ko' or 'en' - 리포트 언어
     
     Returns:
         {'checks': [...], 'summary': {...}, 'metadata': {...}}
     """
+    # ─── 번역 딕셔너리 ───
+    T = {
+        'ko': {
+            'cat_formula': '수식 오류', 'cat_capital': 'Capital Stack',
+            'cat_irr': 'IRR 합리성', 'cat_debt': 'Debt Schedule',
+            'cat_revenue': 'Revenue 현실성', 'cat_summary': '종합',
+            # Formula errors
+            'conv_fail_t': 'xlsb → xlsx 변환 실패',
+            'conv_fail_d': '파일 형식 변환 중 오류 발생. 수식 분석 불가.',
+            'conv_fail_a': 'LibreOffice 설치 확인 or xlsx 직접 업로드 권장',
+            'conv_err_t': 'xlsb → xlsx 변환 에러',
+            'conv_err_d': '변환 오류: ',
+            'conv_err_a': 'xlsx로 재저장 후 업로드',
+            'formula_t': '심각한 수식 에러 {n}개',
+            'formula_d': '#NAME?/#REF!/#DIV/0 등 에러. 샘플: ',
+            'formula_a': '원본 모델러에게 해당 셀 재확인 요청. Named Range 깨짐 or 외부 참조 오류 추정.',
+            'na_many_t': '#N/A 값 {n}개',
+            'na_many_d': 'VLOOKUP/INDEX 미스매치 or 빈 lookup 범위 가능. 정상일 수 있음.',
+            'na_many_a': '핵심 계산 탭(Returns, CF, Summary)에 #N/A 있는지 집중 확인',
+            'ext_ref_t': '외부 파일 참조 {n}곳',
+            'ext_ref_d': '담당자 local path 참조 가능성. 샘플: ',
+            'ext_ref_a': '링크 끊기(Break Links) or 값 복사 처리 필요',
+            'parse_err_t': '수식 파싱 실패',
+            'parse_err_d': '엑셀 구조 분석 중 오류: ',
+            'parse_err_a': '파일 무결성 확인',
+            # Capital Stack
+            'stack_t': 'Capital Stack 합계 불일치 ({err:.1f}% 오차)',
+            'stack_a': 'Summary 탭 Capital Stack 수식 재검증',
+            'debt_ratio_t': 'Debt 비율 이상치 ({r:.1f}%)',
+            'debt_ratio_d': '일반적 Debt 40-60% 범위를 벗어남',
+            'debt_ratio_a': '금융 자문사/Debt Sizing 결과 재확인',
+            'te_high_t': 'TE 비율 과다 ({r:.1f}%)',
+            'te_high_d': 'TE 40% 초과 시 Sponsor 희석 심각',
+            'te_high_a': 'TE 투자 계약 조건 재검토',
+            'sponsor_low_t': 'Sponsor Eq 비율 과소 ({r:.1f}%)',
+            'sponsor_low_d': 'Sponsor 5% 미만 시 프로젝트 관여도 낮음',
+            'sponsor_low_a': 'Sponsor 실질 참여 구조 확인',
+            'summary_t': 'Summary 탭 파싱 제한',
+            'summary_d': '자동 체크 일부 스킵: ',
+            'summary_a': '수동으로 Summary 탭 확인',
+            # IRR
+            'irr_high_t': '{label} 과도 ({p:.2f}%)',
+            'irr_high_d': '25%+ IRR은 일반 Solar+BESS 드문 수치',
+            'irr_high_a': 'Revenue/CAPEX 가정 재검토',
+            'irr_low_t': '{label} 과소 ({p:.2f}%)',
+            'irr_low_d': '5% 미만 IRR은 투자 매력 부족',
+            'irr_low_a': 'CAPEX/OPEX/Revenue 전면 재검토',
+            'irr_contract_t': 'Contract IRR > Full Life IRR ({sc:.2f}% vs {sf:.2f}%)',
+            'irr_contract_d': 'Merchant 기간(Y26+) CF가 음수 또는 IRR 끌어내림. PPA 종료 후 수익성 악화 신호',
+            'irr_contract_a': 'Merchant 가정(PV $61, BESS Toll 종료) 재검토',
+            # Debt
+            'dscr_low_t': 'DSCR 최저값 위험 ({v:.2f})',
+            'dscr_low_d': 'DSCR 1.20 미만 기간 있음. 표준 covenant 1.30 위반 가능.',
+            'dscr_low_a': 'Debt sizing 재검토 또는 cash sweep 조항 확인',
+            'dscr_var_t': 'DSCR 편차 과다 ({lo:.2f}~{hi:.2f})',
+            'dscr_var_d': 'Sculpted debt (DSCR 기반 동적 상환) 구조 추정',
+            'dscr_var_a': 'Debt 탭 연도별 상환 스케줄 수동 검토 필수',
+            # Revenue
+            'ppa_t': 'PPA Price 이상치 (${v:.2f}/MWh)',
+            'ppa_d': '일반 Solar PPA $40-90/MWh 범위 밖',
+            'ppa_a': 'PPA 계약서 원본 확인',
+            'merch_t': 'Merchant Price 높음 (${v:.2f}/MWh)',
+            'merch_d': 'Merchant 가격 $100+ 는 공격적 가정',
+            'merch_a': 'Ventyx/WM 예측 근거 확인',
+            'deg_t': 'Degradation 이상치 ({v:.2f}%/yr)',
+            'deg_d': '일반 0.4-0.8%/yr 범위',
+            'deg_a': 'Module warranty 확인',
+            # Recommend
+            'rec_calib_t': '권장 계산 모드: Calibration',
+            'rec_calib_d': '이 모델은 Neptune과 유사한 구조로 보입니다. 근거: ',
+            'rec_calib_none': 'Neptune 패턴 일부 감지',
+            'rec_calib_a': 'Dashboard에서 "🎯 Calibration" 모드로 계산 권장',
+            'rec_predict_t': '권장 계산 모드: Prediction',
+            'rec_predict_d': '일반 PF 구조로 판단됩니다.',
+            'rec_predict_a': 'Dashboard "📈 Prediction" 모드로 계산 (기본값)',
+            'clear_t': '주요 이상 징후 없음',
+            'clear_d': '자동 체크한 5개 카테고리에서 큰 이슈 미발견.',
+            'clear_a': '수동 검토는 여전히 권장',
+            # Mode reasons
+            'reason_sculpted': 'Sculpted debt 구조 감지 (DSCR 편차 큼)',
+            'reason_irr_invert': 'Contract > Full IRR 역전 (Neptune 패턴)',
+            'reason_debt_ratio': 'Debt 비율 {r:.1f}% (Neptune 유사 47.6%)',
+            'reason_te_ratio': 'TE 비율 {r:.1f}% (Neptune 유사 32.5%)',
+        },
+        'en': {
+            'cat_formula': 'Formula Errors', 'cat_capital': 'Capital Stack',
+            'cat_irr': 'IRR Validity', 'cat_debt': 'Debt Schedule',
+            'cat_revenue': 'Revenue Realism', 'cat_summary': 'Summary',
+            'conv_fail_t': 'xlsb → xlsx conversion failed',
+            'conv_fail_d': 'Error during file format conversion. Formula analysis not possible.',
+            'conv_fail_a': 'Check LibreOffice install or upload xlsx directly',
+            'conv_err_t': 'xlsb → xlsx conversion error',
+            'conv_err_d': 'Conversion error: ',
+            'conv_err_a': 'Re-save as xlsx and re-upload',
+            'formula_t': '{n} serious formula errors',
+            'formula_d': '#NAME?/#REF!/#DIV/0 errors. Samples: ',
+            'formula_a': 'Ask the original modeler to verify cells. Likely broken Named Range or external reference errors.',
+            'na_many_t': '{n} #N/A values',
+            'na_many_d': 'VLOOKUP/INDEX mismatch or empty lookup range possible. May be intentional.',
+            'na_many_a': 'Focus on #N/A in core tabs (Returns, CF, Summary)',
+            'ext_ref_t': '{n} external file references',
+            'ext_ref_d': 'Possible user local path references. Samples: ',
+            'ext_ref_a': 'Break links or copy-paste values required',
+            'parse_err_t': 'Formula parsing failed',
+            'parse_err_d': 'Error during Excel structure analysis: ',
+            'parse_err_a': 'Check file integrity',
+            'stack_t': 'Capital Stack sum mismatch ({err:.1f}% error)',
+            'stack_a': 'Re-verify Capital Stack formula in Summary tab',
+            'debt_ratio_t': 'Debt ratio outlier ({r:.1f}%)',
+            'debt_ratio_d': 'Outside typical Debt 40-60% range',
+            'debt_ratio_a': 'Re-verify with financial advisor/Debt Sizing',
+            'te_high_t': 'TE ratio excessive ({r:.1f}%)',
+            'te_high_d': 'TE over 40% means severe Sponsor dilution',
+            'te_high_a': 'Review TE investment agreement terms',
+            'sponsor_low_t': 'Sponsor Eq ratio too low ({r:.1f}%)',
+            'sponsor_low_d': 'Sponsor below 5% suggests low project commitment',
+            'sponsor_low_a': 'Verify actual Sponsor participation structure',
+            'summary_t': 'Summary tab parsing limited',
+            'summary_d': 'Some auto-checks skipped: ',
+            'summary_a': 'Manually verify Summary tab',
+            'irr_high_t': '{label} too high ({p:.2f}%)',
+            'irr_high_d': '25%+ IRR is rare for Solar+BESS',
+            'irr_high_a': 'Re-verify Revenue/CAPEX assumptions',
+            'irr_low_t': '{label} too low ({p:.2f}%)',
+            'irr_low_d': 'IRR below 5% lacks investment appeal',
+            'irr_low_a': 'Comprehensive review of CAPEX/OPEX/Revenue',
+            'irr_contract_t': 'Contract IRR > Full Life IRR ({sc:.2f}% vs {sf:.2f}%)',
+            'irr_contract_d': 'Merchant period (Y26+) CF is negative or drags IRR down. Signal of deteriorating economics post-PPA.',
+            'irr_contract_a': 'Re-verify Merchant assumptions (PV $61, BESS Toll end)',
+            'dscr_low_t': 'DSCR minimum risk ({v:.2f})',
+            'dscr_low_d': 'DSCR below 1.20 in some periods. Standard 1.30 covenant at risk.',
+            'dscr_low_a': 'Re-verify Debt sizing or cash sweep provisions',
+            'dscr_var_t': 'DSCR variance high ({lo:.2f}~{hi:.2f})',
+            'dscr_var_d': 'Sculpted debt (DSCR-based dynamic amortization) likely',
+            'dscr_var_a': 'Manual review of Debt tab annual schedule required',
+            'ppa_t': 'PPA Price outlier (${v:.2f}/MWh)',
+            'ppa_d': 'Outside typical Solar PPA $40-90/MWh range',
+            'ppa_a': 'Verify original PPA contract',
+            'merch_t': 'Merchant Price high (${v:.2f}/MWh)',
+            'merch_d': 'Merchant price $100+ is aggressive',
+            'merch_a': 'Verify Ventyx/WM forecast source',
+            'deg_t': 'Degradation outlier ({v:.2f}%/yr)',
+            'deg_d': 'Typical range 0.4-0.8%/yr',
+            'deg_a': 'Verify Module warranty',
+            'rec_calib_t': 'Recommended Mode: Calibration',
+            'rec_calib_d': 'This model appears similar to Neptune structure. Reasons: ',
+            'rec_calib_none': 'Some Neptune patterns detected',
+            'rec_calib_a': 'Run calculations in "🎯 Calibration" mode',
+            'rec_predict_t': 'Recommended Mode: Prediction',
+            'rec_predict_d': 'Looks like standard PF structure.',
+            'rec_predict_a': 'Run in "📈 Prediction" mode (default)',
+            'clear_t': 'No major anomalies detected',
+            'clear_d': 'No major issues found in 5 auto-checked categories.',
+            'clear_a': 'Manual review still recommended',
+            'reason_sculpted': 'Sculpted debt detected (large DSCR variance)',
+            'reason_irr_invert': 'Contract > Full IRR inversion (Neptune pattern)',
+            'reason_debt_ratio': 'Debt ratio {r:.1f}% (similar to Neptune 47.6%)',
+            'reason_te_ratio': 'TE ratio {r:.1f}% (similar to Neptune 32.5%)',
+        },
+    }
+    t = T.get(lang, T['ko'])
+    
     from openpyxl import load_workbook
     from pyxlsb import open_workbook as open_xlsb
     import tempfile, subprocess, os
     
-    checks = []  # 각 항목: {'category', 'severity', 'code', 'title', 'description', 'action'}
+    checks = []
     metadata = {}
     
     # xlsb인 경우 xlsx로 변환 (openpyxl로 수식 읽기 위해)
@@ -1831,18 +1992,18 @@ def _integrity_check_pf_model(filepath: str) -> dict:
             xlsx_path = filepath.replace('.xlsb', '.xlsx')
             if not os.path.exists(xlsx_path):
                 checks.append({
-                    'category': '수식 오류', 'severity': 'HIGH',
-                    'code': 'CONV_FAIL', 'title': 'xlsb → xlsx 변환 실패',
-                    'description': '파일 형식 변환 중 오류 발생. 수식 분석 불가.',
-                    'action': 'LibreOffice 설치 확인 or xlsx 직접 업로드 권장'
+                    'category': t['cat_formula'], 'severity': 'HIGH',
+                    'code': 'CONV_FAIL', 'title': t['conv_fail_t'],
+                    'description': t['conv_fail_d'],
+                    'action': t['conv_fail_a']
                 })
                 return {'checks': checks, 'summary': {'total': len(checks)}, 'metadata': metadata}
         except Exception as e:
             checks.append({
-                'category': '수식 오류', 'severity': 'HIGH',
-                'code': 'CONV_ERR', 'title': 'xlsb → xlsx 변환 에러',
-                'description': f'변환 오류: {str(e)[:100]}',
-                'action': 'xlsx로 재저장 후 업로드'
+                'category': t['cat_formula'], 'severity': 'HIGH',
+                'code': 'CONV_ERR', 'title': t['conv_err_t'],
+                'description': t['conv_err_d'] + str(e)[:100],
+                'action': t['conv_err_a']
             })
             return {'checks': checks, 'summary': {'total': len(checks)}, 'metadata': metadata}
     
@@ -1892,41 +2053,41 @@ def _integrity_check_pf_model(filepath: str) -> dict:
             sample = formula_errors[:5]
             sample_text = '; '.join([f"{e['sheet']}!{e['cell']}({e['error']})" for e in sample])
             checks.append({
-                'category': '수식 오류', 'severity': 'HIGH',
+                'category': t['cat_formula'], 'severity': 'HIGH',
                 'code': 'FORMULA_ERR',
-                'title': f'심각한 수식 에러 {len(formula_errors)}개',
-                'description': f'#NAME?/#REF!/#DIV/0 등 에러. 샘플: {sample_text}',
-                'action': '원본 모델러에게 해당 셀 재확인 요청. Named Range 깨짐 or 외부 참조 오류 추정.',
+                'title': t['formula_t'].format(n=len(formula_errors)),
+                'description': t['formula_d'] + sample_text,
+                'action': t['formula_a'],
                 'detail': formula_errors[:10],
             })
         
         if len(na_errors) > 50:  # 50개 이상이면 이슈로 판단
             checks.append({
-                'category': '수식 오류', 'severity': 'LOW',
+                'category': t['cat_formula'], 'severity': 'LOW',
                 'code': 'NA_MANY',
-                'title': f'#N/A 값 {len(na_errors)}개',
-                'description': 'VLOOKUP/INDEX 미스매치 or 빈 lookup 범위 가능. 정상일 수 있음.',
-                'action': '핵심 계산 탭(Returns, CF, Summary)에 #N/A 있는지 집중 확인',
+                'title': t['na_many_t'].format(n=len(na_errors)),
+                'description': t['na_many_d'],
+                'action': t['na_many_a'],
             })
         
         if external_refs:
             sample = external_refs[:3]
             sample_text = '; '.join([f"{e['sheet']}!{e['cell']}" for e in sample])
             checks.append({
-                'category': '수식 오류', 'severity': 'MEDIUM',
+                'category': t['cat_formula'], 'severity': 'MEDIUM',
                 'code': 'EXT_REF',
-                'title': f'외부 파일 참조 {len(external_refs)}곳',
-                'description': f'담당자 local path 참조 가능성. 샘플: {sample_text}',
-                'action': '링크 끊기(Break Links) or 값 복사 처리 필요',
+                'title': t['ext_ref_t'].format(n=len(external_refs)),
+                'description': t['ext_ref_d'] + sample_text,
+                'action': t['ext_ref_a'],
                 'detail': external_refs[:10],
             })
     except Exception as e:
         checks.append({
-            'category': '수식 오류', 'severity': 'HIGH',
+            'category': t['cat_formula'], 'severity': 'HIGH',
             'code': 'PARSE_ERR',
-            'title': '수식 파싱 실패',
-            'description': f'엑셀 구조 분석 중 오류: {str(e)[:100]}',
-            'action': '파일 무결성 확인',
+            'title': t['parse_err_t'],
+            'description': t['parse_err_d'] + str(e)[:100],
+            'action': t['parse_err_a'],
         })
     
     # ═══ 2. Capital Stack 정합성 (값 기반 체크) ═══
@@ -1991,11 +2152,11 @@ def _integrity_check_pf_model(filepath: str) -> dict:
                         err_pct = abs(total - capex_m) / capex_m * 100 if capex_m else 0
                         if err_pct > 1:
                             checks.append({
-                                'category': 'Capital Stack', 'severity': 'HIGH',
+                                'category': t['cat_capital'], 'severity': 'HIGH',
                                 'code': 'STACK_MISMATCH',
-                                'title': f'Capital Stack 합계 불일치 ({err_pct:.1f}% 오차)',
+                                'title': t['stack_t'].format(err=err_pct),
                                 'description': f'Debt ${debt_m:,.0f}K + TE ${te_m:,.0f}K + Sponsor ${sponsor_m:,.0f}K = ${total:,.0f}K, CAPEX ${capex_m:,.0f}K',
-                                'action': 'Summary 탭 Capital Stack 수식 재검증',
+                                'action': t['stack_a'],
                             })
                         
                         debt_ratio = debt_m / capex_m * 100 if capex_m else 0
@@ -2008,27 +2169,27 @@ def _integrity_check_pf_model(filepath: str) -> dict:
                         
                         if debt_ratio < 30 or debt_ratio > 70:
                             checks.append({
-                                'category': 'Capital Stack', 'severity': 'MEDIUM',
+                                'category': t['cat_capital'], 'severity': 'MEDIUM',
                                 'code': 'DEBT_RATIO',
-                                'title': f'Debt 비율 이상치 ({debt_ratio:.1f}%)',
-                                'description': '일반적 Debt 40-60% 범위를 벗어남',
-                                'action': '금융 자문사/Debt Sizing 결과 재확인',
+                                'title': t['debt_ratio_t'].format(r=debt_ratio),
+                                'description': t['debt_ratio_d'],
+                                'action': t['debt_ratio_a'],
                             })
                         if te_ratio > 45:
                             checks.append({
-                                'category': 'Capital Stack', 'severity': 'MEDIUM',
+                                'category': t['cat_capital'], 'severity': 'MEDIUM',
                                 'code': 'TE_RATIO_HIGH',
-                                'title': f'TE 비율 과다 ({te_ratio:.1f}%)',
-                                'description': 'TE 40% 초과 시 Sponsor 희석 심각',
-                                'action': 'TE 투자 계약 조건 재검토',
+                                'title': t['te_high_t'].format(r=te_ratio),
+                                'description': t['te_high_d'],
+                                'action': t['te_high_a'],
                             })
                         if sponsor_ratio < 5:
                             checks.append({
-                                'category': 'Capital Stack', 'severity': 'MEDIUM',
+                                'category': t['cat_capital'], 'severity': 'MEDIUM',
                                 'code': 'SPONSOR_LOW',
-                                'title': f'Sponsor Eq 비율 과소 ({sponsor_ratio:.1f}%)',
-                                'description': 'Sponsor 5% 미만 시 프로젝트 관여도 낮음',
-                                'action': 'Sponsor 실질 참여 구조 확인',
+                                'title': t['sponsor_low_t'].format(r=sponsor_ratio),
+                                'description': t['sponsor_low_d'],
+                                'action': t['sponsor_low_a'],
                             })
                     
                     # IRR 체크 (Summary 탭에서 직접)
@@ -2048,19 +2209,19 @@ def _integrity_check_pf_model(filepath: str) -> dict:
                             pct = val * 100 if 0 < val < 1 else val
                             if pct > 25:
                                 checks.append({
-                                    'category': 'IRR 합리성', 'severity': 'MEDIUM',
+                                    'category': t['cat_irr'], 'severity': 'MEDIUM',
                                     'code': 'IRR_HIGH',
-                                    'title': f'{label} 과도 ({pct:.2f}%)',
-                                    'description': f'25%+ IRR은 일반 Solar+BESS 드문 수치',
-                                    'action': 'Revenue/CAPEX 가정 재검토',
+                                    'title': t['irr_high_t'].format(label=label, p=pct),
+                                    'description': t['irr_high_d'],
+                                    'action': t['irr_high_a'],
                                 })
                             elif pct < 5:
                                 checks.append({
-                                    'category': 'IRR 합리성', 'severity': 'HIGH',
+                                    'category': t['cat_irr'], 'severity': 'HIGH',
                                     'code': 'IRR_LOW',
-                                    'title': f'{label} 과소 ({pct:.2f}%)',
-                                    'description': '5% 미만 IRR은 투자 매력 부족',
-                                    'action': 'CAPEX/OPEX/Revenue 전면 재검토',
+                                    'title': t['irr_low_t'].format(label=label, p=pct),
+                                    'description': t['irr_low_d'],
+                                    'action': t['irr_low_a'],
                                 })
                     
                     # Contract > Full 역전 체크
@@ -2069,19 +2230,19 @@ def _integrity_check_pf_model(filepath: str) -> dict:
                         sc = sponsor_contract * 100 if 0 < sponsor_contract < 1 else sponsor_contract
                         if sc > sf + 2:  # Contract가 Full보다 2%p 이상 높으면
                             checks.append({
-                                'category': 'IRR 합리성', 'severity': 'MEDIUM',
+                                'category': t['cat_irr'], 'severity': 'MEDIUM',
                                 'code': 'IRR_CONTRACT_HIGH',
-                                'title': f'Contract IRR > Full Life IRR ({sc:.2f}% vs {sf:.2f}%)',
-                                'description': 'Merchant 기간(Y26+) CF가 음수 또는 IRR 끌어내림. PPA 종료 후 수익성 악화 신호',
-                                'action': 'Merchant 가정(PV $61, BESS Toll 종료) 재검토',
+                                'title': t['irr_contract_t'].format(sc=sc, sf=sf),
+                                'description': t['irr_contract_d'],
+                                'action': t['irr_contract_a'],
                             })
             except Exception as e:
                 checks.append({
-                    'category': 'Capital Stack', 'severity': 'LOW',
+                    'category': t['cat_capital'], 'severity': 'LOW',
                     'code': 'SUMMARY_PARSE',
-                    'title': 'Summary 탭 파싱 제한',
-                    'description': f'자동 체크 일부 스킵: {str(e)[:80]}',
-                    'action': '수동으로 Summary 탭 확인',
+                    'title': t['summary_t'],
+                    'description': t['summary_d'] + str(e)[:80],
+                    'action': t['summary_a'],
                 })
     except Exception:
         pass
@@ -2113,19 +2274,19 @@ def _integrity_check_pf_model(filepath: str) -> dict:
                     
                     if min_dscr < 1.20:
                         checks.append({
-                            'category': 'Debt Schedule', 'severity': 'HIGH',
+                            'category': t['cat_debt'], 'severity': 'HIGH',
                             'code': 'DSCR_LOW',
-                            'title': f'DSCR 최저값 위험 ({min_dscr:.2f})',
-                            'description': f'DSCR 1.20 미만 기간 있음. 표준 covenant 1.30 위반 가능.',
-                            'action': 'Debt sizing 재검토 또는 cash sweep 조항 확인',
+                            'title': t['dscr_low_t'].format(v=min_dscr),
+                            'description': t['dscr_low_d'],
+                            'action': t['dscr_low_a'],
                         })
                     if max_dscr - min_dscr > 1.0:
                         checks.append({
-                            'category': 'Debt Schedule', 'severity': 'MEDIUM',
+                            'category': t['cat_debt'], 'severity': 'MEDIUM',
                             'code': 'DSCR_VARIANCE',
-                            'title': f'DSCR 편차 과다 ({min_dscr:.2f}~{max_dscr:.2f})',
-                            'description': 'Sculpted debt (DSCR 기반 동적 상환) 구조 추정',
-                            'action': 'Debt 탭 연도별 상환 스케줄 수동 검토 필수',
+                            'title': t['dscr_var_t'].format(lo=min_dscr, hi=max_dscr),
+                            'description': t['dscr_var_d'],
+                            'action': t['dscr_var_a'],
                         })
     except Exception:
         pass
@@ -2151,32 +2312,32 @@ def _integrity_check_pf_model(filepath: str) -> dict:
                         if 'ppa' in k_lower and 'price' in k_lower:
                             if v < 20 or v > 150:
                                 checks.append({
-                                    'category': 'Revenue 현실성', 'severity': 'MEDIUM',
+                                    'category': t['cat_revenue'], 'severity': 'MEDIUM',
                                     'code': 'PPA_RANGE',
-                                    'title': f'PPA Price 이상치 (${v:.2f}/MWh)',
-                                    'description': f'일반 Solar PPA $40-90/MWh 범위 밖',
-                                    'action': 'PPA 계약서 원본 확인',
+                                    'title': t['ppa_t'].format(v=v),
+                                    'description': t['ppa_d'],
+                                    'action': t['ppa_a'],
                                 })
                             metadata['ppa_price'] = v
                         elif 'merchant' in k_lower and 'price' in k_lower:
                             if v > 100:
                                 checks.append({
-                                    'category': 'Revenue 현실성', 'severity': 'LOW',
+                                    'category': t['cat_revenue'], 'severity': 'LOW',
                                     'code': 'MERCHANT_HIGH',
-                                    'title': f'Merchant Price 높음 (${v:.2f}/MWh)',
-                                    'description': 'Merchant 가격 $100+ 는 공격적 가정',
-                                    'action': 'Ventyx/WM 예측 근거 확인',
+                                    'title': t['merch_t'].format(v=v),
+                                    'description': t['merch_d'],
+                                    'action': t['merch_a'],
                                 })
                             metadata['merchant_price'] = v
                         elif 'degradation' in k_lower:
                             deg_pct = v * 100 if v < 0.1 else v
                             if deg_pct == 0 or deg_pct > 1.5:
                                 checks.append({
-                                    'category': 'Revenue 현실성', 'severity': 'MEDIUM',
+                                    'category': t['cat_revenue'], 'severity': 'MEDIUM',
                                     'code': 'DEGRADATION',
-                                    'title': f'Degradation 이상치 ({deg_pct:.2f}%/yr)',
-                                    'description': '일반 0.4-0.8%/yr 범위',
-                                    'action': 'Module warranty 확인',
+                                    'title': t['deg_t'].format(v=deg_pct),
+                                    'description': t['deg_d'],
+                                    'action': t['deg_a'],
                                 })
                             metadata['degradation_pct'] = deg_pct
             except Exception:
@@ -2194,7 +2355,7 @@ def _integrity_check_pf_model(filepath: str) -> dict:
     if metadata.get('dscr_sample'):
         vals = metadata['dscr_sample']
         if vals and max(vals) - min(vals) > 0.5:
-            mode_reasons.append('Sculpted debt 구조 감지 (DSCR 편차 큼)')
+            mode_reasons.append(t['reason_sculpted'])
             recommended_mode = 'calibration'
     
     # 지표 2: Contract IRR > Full IRR → Merchant 구간 영향 크다는 신호 (Neptune 특성)
@@ -2204,18 +2365,18 @@ def _integrity_check_pf_model(filepath: str) -> dict:
         sf = s_full * 100 if 0 < s_full < 1 else s_full
         sc = s_contract * 100 if 0 < s_contract < 1 else s_contract
         if sc > sf + 1.5:
-            mode_reasons.append('Contract > Full IRR 역전 (Neptune 패턴)')
+            mode_reasons.append(t['reason_irr_invert'])
             recommended_mode = 'calibration'
     
     # 지표 3: Debt 비율 50% 이하 (Neptune 47.6%) → Calibration 유리
     debt_r = metadata.get('debt_ratio', 0)
     if 40 < debt_r < 55:
-        mode_reasons.append(f'Debt 비율 {debt_r:.1f}% (Neptune 유사 47.6%)')
+        mode_reasons.append(t['reason_debt_ratio'].format(r=debt_r))
     
     # 지표 4: TE 비율 30%+ (Neptune 32.5%)
     te_r = metadata.get('te_ratio', 0)
     if te_r > 28:
-        mode_reasons.append(f'TE 비율 {te_r:.1f}% (Neptune 유사 32.5%)')
+        mode_reasons.append(t['reason_te_ratio'].format(r=te_r))
         recommended_mode = 'calibration'
     
     metadata['recommended_mode'] = recommended_mode
@@ -2224,29 +2385,29 @@ def _integrity_check_pf_model(filepath: str) -> dict:
     # 추천 mode 체크 항목 추가
     if recommended_mode == 'calibration':
         checks.append({
-            'category': '종합', 'severity': 'LOW',
+            'category': t['cat_summary'], 'severity': 'LOW',
             'code': 'RECOMMEND_CALIB',
-            'title': '권장 계산 모드: Calibration',
-            'description': f'이 모델은 Neptune과 유사한 구조로 보입니다. 근거: {", ".join(mode_reasons) if mode_reasons else "Neptune 패턴 일부 감지"}',
-            'action': 'Dashboard에서 "🎯 Calibration" 모드로 계산 권장',
+            'title': t['rec_calib_t'],
+            'description': t['rec_calib_d'] + (", ".join(mode_reasons) if mode_reasons else t['rec_calib_none']),
+            'action': t['rec_calib_a'],
         })
     else:
         checks.append({
-            'category': '종합', 'severity': 'OK',
+            'category': t['cat_summary'], 'severity': 'OK',
             'code': 'RECOMMEND_PREDICT',
-            'title': '권장 계산 모드: Prediction',
-            'description': '일반 PF 구조로 판단됩니다.',
-            'action': 'Dashboard "📈 Prediction" 모드로 계산 (기본값)',
+            'title': t['rec_predict_t'],
+            'description': t['rec_predict_d'],
+            'action': t['rec_predict_a'],
         })
 
     # ═══ 체크 없음 (No Issues) — 긍정 신호 ═══
     if not checks:
         checks.append({
-            'category': '종합', 'severity': 'OK',
+            'category': t['cat_summary'], 'severity': 'OK',
             'code': 'ALL_CLEAR',
-            'title': '주요 이상 징후 없음',
-            'description': '자동 체크한 5개 카테고리에서 큰 이슈 미발견.',
-            'action': '수동 검토는 여전히 권장',
+            'title': t['clear_t'],
+            'description': t['clear_d'],
+            'action': t['clear_a'],
         })
     
     # 심각도별 요약
@@ -2268,9 +2429,10 @@ def _integrity_check_pf_model(filepath: str) -> dict:
 @app.post("/valuation/integrity-check")
 async def integrity_check_upload(
     file: UploadFile = File(...),
+    lang: str = 'ko',
     user=Depends(get_current_user)
 ):
-    """PF 엑셀 모델 정합성 체크 (5개 카테고리 × HIGH/MEDIUM/LOW)"""
+    """PF 엑셀 모델 정합성 체크 (5개 카테고리 × HIGH/MEDIUM/LOW). lang=ko|en"""
     if not (file.filename.endswith(".xlsb") or file.filename.endswith(".xlsx")):
         raise HTTPException(400, "xlsb 또는 xlsx 파일만 가능합니다.")
     
@@ -2280,7 +2442,7 @@ async def integrity_check_upload(
         tmp_path = tmp.name
     
     try:
-        result = _integrity_check_pf_model(tmp_path)
+        result = _integrity_check_pf_model(tmp_path, lang=lang)
         result['filename'] = file.filename
         return {"ok": True, **result}
     except Exception as e:
