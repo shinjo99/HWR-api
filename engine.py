@@ -804,11 +804,18 @@ def _calc_engine(inputs: dict) -> dict:
         te_cf_yr = te_dist_cash + te_tax_benefit + te_ptc_benefit
         te_cfs_final.append(te_cf_yr)
 
-        # Unlevered aftertax CF (Neptune R51 구조):
-        # = Partnership CF - TE distribution (Debt 제외한 Sponsor+TE 관점)
-        # Unlev는 Partnership 전체 관점이라 Partnership CF 기준 TE 분배 유지
-        te_dist_unlev = partnership_cf * te_cash_pct
-        unlev_aftertax_cf = partnership_cf - te_dist_unlev + (ptc_benefit if credit_mode == 'PTC' and yr <= 10 else 0)
+        # Unlevered Project CF (Project IRR 계산용)
+        # ═══════════════════════════════════════════════════════════
+        # Project 전체 관점: Sponsor + TE 합산, Debt만 제외
+        # = Partnership CF + PTC (if applicable)
+        #
+        # 이전 버그: TE dist를 빼서 Sponsor 몫만 남김 → Project IRR 왜곡
+        # Pre-flip TE 99% 시 Unlev CF ≈ Partnership CF × 1% (거의 0)
+        # → Project NPV 음수 잘못 표시
+        #
+        # 올바른 정의: Unlevered = "Debt 없다고 가정한 Project 전체 수익"
+        # Partnership (Sponsor + TE)이 공동으로 받는 전체 현금
+        unlev_aftertax_cf = partnership_cf + (ptc_benefit if credit_mode == 'PTC' and yr <= 10 else 0)
 
         cashflows.append(op_cf); unlev_cfs.append(unlev_aftertax_cf); sponsor_cfs.append(s_cf); pretax_cfs.append(s_cf_pretax)
         if yr<=10:
