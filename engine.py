@@ -944,20 +944,31 @@ _CALIB_FILL_IF_MISSING = {
 }
 
 def _apply_calibration_defaults(inputs: dict) -> dict:
-    """calibration_mode='calibration'일 때 Neptune 구조적 파라미터 자동 주입.
-    
+    """calibration_mode='calibration'일 때 Neptune 구조적 파라미터 기본값 주입.
+
+    fill-if-missing 방식 (변경됨):
+      - 사용자가 명시적으로 값 제공 → 그 값 사용 (override 가능)
+      - 사용자가 값 제공 안 함 → Neptune 실측값 사용 (default)
+
+    이를 통해 Calibration 모드에서도 사용자가 시나리오 분석 가능:
+      예) "Neptune이 pre_flip_cash_te=9.2 대신 25였으면 IRR 어땠을까?"
+      예) "Construction Cost $640M 대신 $700M이면?"
+
+    이전 동작: _CALIB_STRUCTURAL이 사용자 input을 강제 덮어썼음.
+    현재 동작: 사용자 input이 우선, 없을 때만 Neptune default 채움.
+
     주의: _calc_engine에 직접 넣지 않는다 — _decompose_irr_difference가
-    step별로 실험적 param 변경 (예: pre_flip_cash_te 25.5→99) 할 때
-    auto-merge가 덮어쓰면 decompose가 깨진다.
+    step별로 실험적 param 변경 할 때 재호출 시 혼란 방지.
     따라서 endpoint 레벨에서만 호출한다.
     """
     if inputs.get('calibration_mode') != 'calibration':
         return inputs
     merged = dict(inputs)
-    # 구조적 파라미터는 Neptune 값 강제
+    # 구조적 파라미터: fill-if-missing (사용자 input 우선)
     for k, v in _CALIB_STRUCTURAL.items():
-        merged[k] = v
-    # 나머지는 fill-if-missing
+        if k not in merged or merged[k] is None:
+            merged[k] = v
+    # 나머지 파라미터도 fill-if-missing
     for k, v in _CALIB_FILL_IF_MISSING.items():
         if k not in merged or merged[k] is None:
             merged[k] = v
