@@ -873,6 +873,8 @@ def _calc_engine(inputs: dict) -> dict:
         'dev_margin':    round(dev_margin,0),
         'epc_margin':    round(epc_margin,0),
         'total_margin':  round(total_margin,0),
+        # 계산에 사용된 실제 모드 (프론트엔드 모드 분기용, 2026-04-20 추가)
+        'calibration_mode': 'calibration' if is_calibration else 'prediction',
         'levered_irr':   round(lirr,6) if (lirr is not None and not np.isnan(lirr)) else None,
         'unlevered_irr': round(uirr,6) if (uirr is not None and not np.isnan(uirr)) else None,
         'sponsor_irr':   round(sirr,6) if (sirr is not None and not np.isnan(sirr)) else None,
