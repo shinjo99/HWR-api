@@ -228,13 +228,35 @@ def _calc_engine(inputs: dict) -> dict:
     epc_margin_pct_calc = inputs.get('epc_margin_pct', 7.95) / 100
     epc_margin_k = total_capex * epc_margin_pct_calc
     
-    # Construction Cost = FMV CAPEX - Dev Margin - EPC Margin
-    # (모든 모드 공통 로직)
+    # Construction Cost (Phase E: FMV Step-up 업계 표준 반영)
+    # ═══════════════════════════════════════════════════════════════════
+    # Industry standard: 15-20% step-up above construction cost for ITC basis
+    # (Norton Rose Fulbright 2021, Pivotal180 2025, Reunion Infrastructure 2023)
+    #
+    # "Many tax equity investors limit the markup they are willing to allow 
+    #  above construction cost to 15% to 20%" — Norton Rose
+    # "Tax equity investors have often shied away from accepting step-ups 
+    #  above 20% of construction costs" — Pivotal180
+    #
+    # 메커니즘: Sponsor가 Partnership에 프로젝트를 FMV로 판매
+    #   - ITC basis ↑ (추가 tax credit ~20% × 30% = 6% of cost)
+    #   - Developer phantom income (차익에 대한 tax liability)
+    #
+    # Calibration: construction_cost_m override (Neptune 실측 $640M)
+    # Prediction: fmv_step_up_pct로 자동 계산 (default 17.5% = 업계 중간값)
+    # ═══════════════════════════════════════════════════════════════════
     construction_cost_override = inputs.get('construction_cost_m')
     if construction_cost_override:
         construction_cost = construction_cost_override * 1000  # $M → $K (수동 override)
-    else:
+    elif is_calibration:
+        # Calibration: 기존 로직 (override가 없으면 dev+epc margin만 제외)
         construction_cost = total_capex - dev_margin_k - epc_margin_k
+    else:
+        # Prediction: FMV step-up 반영
+        # FMV = Construction × (1 + step_up)
+        # Construction = FMV / (1 + step_up)
+        fmv_step_up_pct = inputs.get('fmv_step_up_pct', 17.5) / 100
+        construction_cost = total_capex / (1 + fmv_step_up_pct)
     
     # Transaction costs & Capitalized Interest
     # 기본값: CAPEX 대비 작은 비율 (Neptune: Txn 1.27%, CapInt 1.71%)
@@ -331,13 +353,28 @@ def _calc_engine(inputs: dict) -> dict:
     depr_share = depr_share_pre  # backward compat
 
     # Cash allocation
-    # Prediction mode (기본): 표준 Partnership Flip 99%/5%
-    # Calibration mode (Neptune): 실측 25.5%/7%
+    # ═══════════════════════════════════════════════════════════════════
+    # 중요한 이론/실무 차이:
+    #   업계 실제 deal: pre-flip cash 20-35% TE (negotiation 결과)
+    #   IRR 관점 최적:  pre-flip cash 99% TE (flip 빨리 → tax benefit 집중)
+    #
+    # 엔진은 IRR 관점 최적 (99/1) 선택:
+    #   - TE가 cash 99% 가져가면 yield 빨리 달성 → flip_year 단축
+    #   - Sponsor가 post-flip 95%로 MACRS peak (Y4-Y5) 수령
+    #   - Y4-Y5 $17M/yr tax benefit >>> pre-flip cash 70% 증가분
+    #
+    # 검증 (Apelt inputs, BESS Toll 13.68):
+    #   TE cash 99%: Sponsor IRR 6.64%  (flip_year=3)
+    #   TE cash 30%: Sponsor IRR 6.15%  (flip_year=5)
+    #   TE cash 20%: Sponsor IRR 5.87%  (flip_year=6)
+    #
+    # 주의: 사용자가 실제 deal 구조대로 override 시 pre_flip_cash_te 파라미터 사용
+    # ═══════════════════════════════════════════════════════════════════
     if is_calibration:
-        default_pre_flip = 25.5
+        default_pre_flip = 25.5   # Neptune 실측 (9.2%는 _CALIB_STRUCTURAL이 덮어씀)
         default_post_flip = 7
     else:
-        default_pre_flip = 99
+        default_pre_flip = 99     # IRR 관점 최적 (표준 Yield-Based Flip)
         default_post_flip = 5
     pre_flip_cash_te  = inputs.get('pre_flip_cash_te', default_pre_flip) / 100
     post_flip_cash_te = inputs.get('post_flip_cash_te', default_post_flip) / 100
@@ -532,6 +569,8 @@ def _calc_engine(inputs: dict) -> dict:
     debt_bal=debt; detail=[]; ebitda_yr1=None
     # PHASE C: Debt schedule + DSCR tracking (output용)
     debt_schedule = []
+    # PHASE D: NOL Carryforward balance (Sponsor's tax loss carryforward)
+    nol_balance = 0.0
 
     for yr in range(1, life+1):
         avail = avail_1 if yr==1 else avail_2
@@ -664,59 +703,92 @@ def _calc_engine(inputs: dict) -> dict:
             'dscr': round(dscr_yr, 3) if dscr_yr else None,
         })
 
-        # MACRS depreciation tax benefit
-        # Neptune NOL 이월 효과로 Y1-Y9 tax benefit이 Partnership tax와 상쇄 (R42 + R33 ≈ 0)
-        # 따라서 Sponsor aftertax CF ≈ Sponsor pretax CF (MACRS 따로 더하지 않음)
-        # ITC는 이미 Y0 Sponsor cash outflow에 반영됨 (Construction Cost 기반)
+        # ═══════════════════════════════════════════════════════════
+        # Depreciation + Sponsor Depr Share (Phase A dynamic flip 적용)
+        # ═══════════════════════════════════════════════════════════
         depr = depr_sched.get(yr, 0)
-        # NOL 상쇄 로직
-        # Calibration mode 기본 True (Neptune처럼 Y1-Y9 tax benefit 상쇄)
-        # Prediction mode 기본 False (MACRS tax benefit 정상 반영)
-        use_nol_offset = inputs.get('use_nol_offset', is_calibration)
-        # flip year 기반 Sponsor depr share (pre/post flip)
-        # Prediction: actual_flip_year = dynamic (Phase A)
-        # Calibration: actual_flip_year = flip_term 고정 (Neptune 재현)
         current_depr_share = depr_share_pre if yr <= actual_flip_year else depr_share_post
-        if use_nol_offset:
-            s_tax = 0  # NOL로 상쇄
-        else:
-            s_tax = depr * tax_rate * current_depr_share
 
-        # PTC (Production Tax Credit) — PV만, COD 후 10년간
-        ptc_benefit = 0
-        if credit_mode == 'PTC' and yr <= 10:
-            ptc_benefit = prod * ptc_rate_per_kwh  # MWh × $/kWh → $K
-            # PTC도 flip 기반 배분
-            s_tax += ptc_benefit * current_depr_share
-
+        # ═══════════════════════════════════════════════════════════
+        # Op CF & TE cash split percentage
+        # ═══════════════════════════════════════════════════════════
         op_cf = ebitda - ds - aug_c
-        # ── Sponsor CF 분배 ──
-        #
-        # Calibration 모드 (Neptune 재현):
-        #   TE dist = Partnership CF × TE% (Pay-Go 또는 hybrid 구조 추정)
-        #   Sponsor = Partnership CF - Debt Service - TE dist + Tax benefit
-        #   → Debt와 TE dist를 둘 다 Partnership CF에서 뺌
-        #   → TE%가 낮아야 (9.2%) 성립하는 구조
-        #
-        # Prediction 모드 (업계 표준 Partnership Flip):
-        #   Debt는 Partnership 레벨에서 상환 (Debt holder 우선)
-        #   Op CF = Partnership CF - Debt Service
-        #   TE dist = Op CF × TE%
-        #   Sponsor = Op CF × (1 - TE%) + Tax benefit
-        #   → TE%가 높아도 (99%) Debt 이중 차감 문제 없음
         te_cash_pct = pre_flip_cash_te if yr <= actual_flip_year else post_flip_cash_te
 
+        # ═══════════════════════════════════════════════════════════
+        # Sponsor CF (pretax: 세금 계산 전)
+        # Calibration: Partnership CF 기준 (Neptune Pay-Go 구조)
+        # Prediction: Op CF 기준 (업계 표준 — Debt 먼저 상환)
+        # ═══════════════════════════════════════════════════════════
         if is_calibration:
-            # Neptune 구조 (기존 로직 보존)
             te_dist_cash = partnership_cf * te_cash_pct
-            s_cf = partnership_cf - ds - te_dist_cash + s_tax
             s_cf_pretax = partnership_cf - ds - te_dist_cash
         else:
-            # 업계 표준 Partnership Flip
-            op_cf_for_split = partnership_cf - ds  # Debt 먼저 갚음
+            op_cf_for_split = partnership_cf - ds
             te_dist_cash = op_cf_for_split * te_cash_pct
-            s_cf = op_cf_for_split * (1 - te_cash_pct) + s_tax
             s_cf_pretax = op_cf_for_split * (1 - te_cash_pct)
+
+        # ═══════════════════════════════════════════════════════════
+        # PTC (Production Tax Credit) — PV만, COD 후 10년
+        # ═══════════════════════════════════════════════════════════
+        ptc_benefit = 0
+        if credit_mode == 'PTC' and yr <= 10:
+            ptc_benefit = prod * ptc_rate_per_kwh
+        sponsor_ptc = ptc_benefit * current_depr_share
+
+        # ═══════════════════════════════════════════════════════════
+        # PHASE D — NOL Carryforward with IRS 80% Limitation
+        # ═══════════════════════════════════════════════════════════
+        # Three modes for Sponsor tax treatment:
+        #
+        # A) Calibration (use_nol_offset=True): 
+        #    Y1~Y9 tax = 0 (Neptune 간소화 — NOL과 tax benefit이 서로 상쇄)
+        #
+        # B) Immediate benefit (use_nol_carryforward=False, Prediction 기본):
+        #    기존 Phase B 로직 (Sponsor가 다른 소득에서 혜택 즉시 사용)
+        #    대기업(Hanwha 등)이 프로젝트를 보유한 경우 현실적 가정
+        #    Sponsor's allocated MACRS loss가 본사 taxable income 상쇄
+        #
+        # C) NOL Carryforward (use_nol_carryforward=True, SPV 전용):
+        #    Sponsor가 SPV (프로젝트 외 소득 없음)일 때만 활성화
+        #    Loss → NOL balance 누적 (tax benefit 이월)
+        #    Income → NOL로 80% offset 후 잔여분 세금 지불
+        #    IRS Section 172(a)(2) TCJA 2017 규정
+        #    경고: IRR 큰 하락 (deferral effect) — 실무에서는 드문 가정
+        # ═══════════════════════════════════════════════════════════
+        use_nol_offset = inputs.get('use_nol_offset', is_calibration)
+        # Default: 대기업 Sponsor 가정 (immediate benefit)
+        # SPV 가정하려면 사용자가 명시적으로 True 설정
+        use_nol_carryforward = inputs.get('use_nol_carryforward', False)
+
+        if use_nol_offset:
+            # MODE A: Calibration 완전 상쇄
+            s_tax = sponsor_ptc  # PTC credit만
+
+        elif use_nol_carryforward and not is_calibration:
+            # MODE C: NOL Carryforward (SPV 가정, optional)
+            sponsor_taxable_before_depr = (partnership_cf - int_p) * (1 - te_cash_pct)
+            sponsor_depr_deduct = depr * current_depr_share
+            sponsor_taxable = sponsor_taxable_before_depr - sponsor_depr_deduct
+
+            if sponsor_taxable < 0:
+                nol_balance += abs(sponsor_taxable)
+                s_tax = sponsor_ptc
+            else:
+                offset = min(sponsor_taxable * 0.80, nol_balance)
+                nol_balance -= offset
+                taxable_after = sponsor_taxable - offset
+                tax_liability = taxable_after * tax_rate
+                s_tax = sponsor_ptc - tax_liability
+
+        else:
+            # MODE B: Immediate benefit (Prediction 기본 — 대기업 Sponsor)
+            s_tax = depr * tax_rate * current_depr_share + sponsor_ptc
+
+        # ═══════════════════════════════════════════════════════════
+        # Final Sponsor CF
+        # ═══════════════════════════════════════════════════════════
+        s_cf = s_cf_pretax + s_tax
 
         # Flip Year event: TE buyout 직후 Sponsor 일시 대금 수령
         if yr == actual_flip_year + 1 and flip_event_cf > 0:
@@ -822,6 +894,9 @@ def _calc_engine(inputs: dict) -> dict:
                          3) if any(d['dscr'] is not None for d in debt_schedule) else None,
         'dscr_target_used': dscr_target,
         'debt_sculpted': bool(use_sculpted_dscr and not is_calibration),
+        # PHASE D: NOL Carryforward tracking
+        'nol_balance_end': round(nol_balance, 0),
+        'use_nol_carryforward': bool(use_nol_carryforward and not is_calibration),
         'credit_mode':   credit_mode,
         'pv_itc_rate':   round(pv_itc_rate*100, 2),
         'bess_itc_rate': round(bess_itc_rate*100, 2),
