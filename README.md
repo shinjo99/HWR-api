@@ -1,6 +1,6 @@
 # HWR-api
 
-**Hanwha Renewables USA — Dashboard 백엔드 API**
+**Hanwha Energy USA Holdings — Dashboard 백엔드 API**
 
 FastAPI 기반 REST API. PF (Project Finance) 모델 계산, 정합성 검증, PDF 리포트 생성, AI 기반 시장 리서치 제공.
 
