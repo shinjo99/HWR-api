@@ -12,7 +12,7 @@ FastAPI 기반 REST API. PF (Project Finance) 모델 계산, 정합성 검증, P
 
 - **구축 기간**: 약 1주 (2026년 3~4월, Claude 4.6 Opus 활용)
 - **구축 환경**: Git CLI 미사용. GitHub 웹 인터페이스 드래그&드롭으로 배포
-- **사용 범위**: Hanwha Renewables USA 내부 (Solar + BESS 프로젝트 평가)
+- **사용 범위**: Hanwha Energy USA Holdings 내부 (Solar + BESS 프로젝트 평가)
 - **엔진 검증 기준 모델**: Neptune (UT, WECC) PF Model
   - Excel Sponsor IRR 9.92% vs 엔진 10.14% (±0.22%p 오차)
 
@@ -117,6 +117,53 @@ API 문서 자동 생성: `http://localhost:8080/docs` (FastAPI Swagger UI)
 
 ---
 
+## CI/CD (GitHub Actions)
+
+`.github/workflows/ci.yml` 에 정의된 자동 검증. **main 브랜치에 push 또는 PR 생성 시 자동 실행**.
+
+### 검증 단계
+
+| Step | 검증 내용 | 실패 시 |
+|---|---|---|
+| 1 | 모든 `.py` 파일 syntax check (`py_compile`) | 문법 에러 표시 |
+| 2 | `main.py` 전체 import + FastAPI 앱 로드 | import 에러 / 앱 초기화 실패 |
+| 3 | 엔드포인트 수 >= 40 + 필수 9개 (`/auth/login`, `/valuation/calculate` 등) 등록 확인 | 누락 엔드포인트 표시 |
+| 4 | 각 라우터 모듈 17개 개별 import | 누락된 import / 히든 의존성 |
+
+### 잡아내는 버그 유형
+
+과거 Phase 4 리팩터링에서 수동으로 잡아야 했던 패턴들:
+- ✅ `NameError: name 'X' is not defined` (import 누락)
+- ✅ `ImportError: cannot import name 'Y'` (순환 참조)
+- ✅ `SyntaxError` (문자 오류, triple-quote 매칭 등)
+- ✅ 엔드포인트 누락 (라우터 등록 실수)
+- ❌ **런타임 버그는 잡지 못함** (실제 계산 결과 오류, Firebase 연결 문제 등)
+
+### 수동 배포 vs CI
+
+현재 워크플로우는 **"CI 결과 알림"** 수준 (Railway는 CI 대기 안 함):
+
+```
+파일 수정 → GitHub push → Railway 자동 배포 시작 (2-5분)
+                        ↕ 병렬
+                       GitHub Actions CI 실행 (1-3분)
+                       ↓
+                   ✓ 초록: 배포 결과 신뢰 가능
+                   ❌ 빨강: Actions 탭에서 원인 확인 → 빠른 수정 or 롤백
+```
+
+향후 정식 브랜치/PR 워크플로우 도입 시 **"CI 통과해야만 merge"** 강제 가능 (Branch protection rule).
+
+### CI 실패 시 대응
+
+1. GitHub repo → **Actions 탭** → 실패한 workflow 클릭
+2. 빨간 X 표시된 step 클릭 → 로그 확인
+3. 에러 메시지 기반으로 로컬 수정 → push
+4. 심각한 경우 Railway 이전 배포로 **Revert** (commit 기준 1-clic)
+
+---
+
+
 ## 환경변수
 
 | 변수 | 용도 | 예시 |
@@ -202,8 +249,9 @@ API 문서 자동 생성: `http://localhost:8080/docs` (FastAPI Swagger UI)
 | **Phase 4B** | audit.py 분리 | ✅ 완료 |
 | **Phase 4C** | pdf_report.py 분리 | ✅ 완료 |
 | **Phase 4D** | core/ + schemas + routers/ 분리 (main.py 4,632 → 100줄) | ✅ 완료 (2026-04-20) |
-| Phase 5 | 문서화 | 🟡 진행 중 (README 작성) |
-| Phase 6 | CI/CD (GitHub Actions) | ⏳ 예정 |
+| Phase 5 | 문서화 (README, CI/CD 섹션) | ✅ 완료 |
+| **Phase 6** | CI/CD (GitHub Actions — syntax + import 검증) | ✅ 완료 |
+| Phase 7 (향후) | Branch protection + PR 필수 통과 워크플로우 | ⏳ 예정 |
 
 ---
 
@@ -264,7 +312,7 @@ Python 3.11+. 전체 의존성 `requirements.txt` 참조.
 
 ## 라이선스
 
-Proprietary. Hanwha Renewables USA 내부 사용.
+Proprietary. Hanwha Energy USA Holdings 내부 사용.
 
 ---
 

@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-python:
+    name: Python Syntax & Import Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # weasyprint 시스템 의존성 설치 (Ubuntu)
+      - name: Install system dependencies (for weasyprint)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpango-1.0-0 libpangoft2-1.0-0
+
+      # requirements.txt 기반 패키지 설치 + CI 용 anthropic 추가
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          # anthropic은 requirements.txt에 없지만 import 검증에 필요
+          pip install anthropic
+
+      # ── 1. 모든 .py 파일 syntax 체크 ──
+      - name: Python syntax check
+        run: |
+          echo "=== 모든 .py 파일 syntax 검증 ==="
+          FAILED=0
+          for f in $(find . -name "*.py" -not -path "./.git/*"); do
+            if python -m py_compile "$f" 2>&1; then
+              :
+            else
+              echo "  ❌ $f"
+              FAILED=1
+            fi
+          done
+          if [ $FAILED -eq 1 ]; then
+            echo "❌ Python syntax 에러 발견"
+            exit 1
+          fi
+          echo "✓ 모든 .py 파일 syntax OK"
+
+      # ── 2. main.py import + FastAPI 앱 로드 ──
+      - name: Import main.py (critical test)
+        env:
+          JWT_SECRET: ci-test-secret
+          FB_URL: https://ci-test.example.com
+          FB_SECRET: ''
+          ANTHROPIC_API_KEY: ''
+          FRED_API_KEY: ''
+          USERS: test@ci.com:test:viewer
+        run: |
+          echo "=== main.py 전체 import 테스트 ==="
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from main import app
+          routes = [r for r in app.routes if hasattr(r, 'methods')]
+          print(f'✓ FastAPI 앱 로드 성공, 엔드포인트 {len(routes)}개')
+          assert len(routes) >= 40, f'엔드포인트 부족: {len(routes)} < 40'
+          registered = set(r.path for r in routes)
+          critical = ['/', '/health', '/auth/login', '/auth/me',
+                      '/valuation/calculate', '/valuation/integrity-check',
+                      '/valuation/export-pdf', '/benchmark/market', '/dashboard']
+          missing = [p for p in critical if p not in registered]
+          assert not missing, f'필수 엔드포인트 누락: {missing}'
+          print(f'✓ 주요 엔드포인트 {len(critical)}개 등록 확인')
+          "
+
+      # ── 3. 각 라우터 모듈 개별 import ──
+      - name: Import each router module
+        env:
+          JWT_SECRET: ci-test-secret
+          FB_URL: https://ci-test.example.com
+          FB_SECRET: ''
+          ANTHROPIC_API_KEY: ''
+          FRED_API_KEY: ''
+          USERS: test@ci.com:test:viewer
+        run: |
+          echo "=== 각 라우터 모듈 개별 import ==="
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          modules = ['engine', 'audit', 'pdf_report', 'schemas',
+                     'core.config', 'core.deps', 'core.firebase',
+                     'routers.meta', 'routers.auth', 'routers.dashboard',
+                     'routers.divest', 'routers.atlas',
+                     'routers.ppv', 'routers.financial', 'routers.project',
+                     'routers.benchmark', 'routers.valuation']
+          failed = []
+          for mod in modules:
+              try:
+                  __import__(mod)
+                  print(f'  ✓ {mod}')
+              except Exception as e:
+                  print(f'  ❌ {mod}: {e}')
+                  failed.append(mod)
+          assert not failed, f'Import 실패: {failed}'
+          print(f'✓ 전체 {len(modules)}개 모듈 import 성공')
+          "
