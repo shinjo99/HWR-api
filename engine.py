@@ -530,6 +530,8 @@ def _calc_engine(inputs: dict) -> dict:
         te_cfs_final = [-te_invest]
 
     debt_bal=debt; detail=[]; ebitda_yr1=None
+    # PHASE C: Debt schedule + DSCR tracking (output용)
+    debt_schedule = []
 
     for yr in range(1, life+1):
         avail = avail_1 if yr==1 else avail_2
@@ -571,30 +573,96 @@ def _calc_engine(inputs: dict) -> dict:
         # Partnership CF = EBITDA - Aug (Neptune R19 방식)
         partnership_cf = ebitda - aug_c
 
-        # Debt Service: Neptune sculpted schedule (DSCR 기반)
-        # Calibration mode 기본 True, Prediction mode 기본 False (균등 amortization)
-        use_sculpted = inputs.get('use_sculpted_debt', is_calibration)
-        if use_sculpted and yr <= 28:
-            # Neptune Case 2 Debt/Partnership 비율 (실측)
-            neptune_debt_ratios = {
-                1: 0.602, 2: 0.604, 3: 0.606, 4: 0.570, 5: 0.800,
-                6: 0.663, 7: 0.663, 8: 0.677, 9: 0.663, 10: 0.263,
-                11: 0.607, 12: 0.700, 13: 0.701, 14: 0.711, 15: 0.701,
-                16: 0.701, 17: 0.701, 18: 0.701, 19: 0.702, 20: 0.700,
-                21: 0.905, 22: 0.914, 23: 0.923, 24: 0.933, 25: 0.938,
-                26: 0.504, 27: 0.504, 28: 0.503,
-            }
-            ratio = neptune_debt_ratios.get(yr, 0)
-            ds = partnership_cf * ratio
-            debt_bal = max(0, debt_bal - max(0, ds - debt_bal * int_rate))
-        elif yr <= loan_term and debt_bal > 0:
-            # 기존 amortization (non-Neptune)
-            int_p = debt_bal * int_rate
-            prin = ann_ds - int_p
-            ds = ann_ds
-            debt_bal = max(0, debt_bal - prin)
+        # ═══════════════════════════════════════════════════════════
+        # Debt Service (Phase C: DSCR-protected Sculpted Debt)
+        # ═══════════════════════════════════════════════════════════
+        # Calibration mode: Neptune hardcoded sculpted ratios (유지)
+        # Prediction mode: DSCR-protected sculpted (NEW in Phase C)
+        #   - Target DSCR 1.30 유지
+        #   - DSCR 위반 시 자동 상환 축소 (Aug 년 등)
+        #   - 최종 연도 balloon payment (잔여 debt 일괄 상환)
+        #   - Safety: 이자는 무조건 지불 (default 방지)
+        use_sculpted_dscr = inputs.get('use_sculpted_dscr', not is_calibration)
+        dscr_target = inputs.get('dscr_target', 1.30)
+
+        int_p = 0  # 이번 해 이자 (tracking용)
+        prin = 0   # 이번 해 원금 상환
+
+        if is_calibration:
+            # Calibration: 기존 Neptune sculpted 로직 (변경 없음)
+            use_sculpted = inputs.get('use_sculpted_debt', True)
+            if use_sculpted and yr <= 28:
+                neptune_debt_ratios = {
+                    1: 0.602, 2: 0.604, 3: 0.606, 4: 0.570, 5: 0.800,
+                    6: 0.663, 7: 0.663, 8: 0.677, 9: 0.663, 10: 0.263,
+                    11: 0.607, 12: 0.700, 13: 0.701, 14: 0.711, 15: 0.701,
+                    16: 0.701, 17: 0.701, 18: 0.701, 19: 0.702, 20: 0.700,
+                    21: 0.905, 22: 0.914, 23: 0.923, 24: 0.933, 25: 0.938,
+                    26: 0.504, 27: 0.504, 28: 0.503,
+                }
+                ratio = neptune_debt_ratios.get(yr, 0)
+                ds = partnership_cf * ratio
+                int_p = debt_bal * int_rate
+                prin = max(0, ds - int_p)
+                debt_bal = max(0, debt_bal - prin)
+            elif yr <= loan_term and debt_bal > 0:
+                int_p = debt_bal * int_rate
+                prin = max(0, ann_ds - int_p)
+                ds = ann_ds
+                debt_bal = max(0, debt_bal - prin)
+            else:
+                ds = 0
         else:
-            ds = 0
+            # Prediction mode
+            if debt_bal > 0 and yr <= loan_term:
+                int_p = debt_bal * int_rate
+                level_principal = max(0, ann_ds - int_p)
+
+                if use_sculpted_dscr and partnership_cf > 0:
+                    # DSCR-protected sculpted
+                    max_ds_dscr = partnership_cf / dscr_target
+
+                    if yr == loan_term:
+                        # 마지막 해: balloon (잔여 debt 전부 상환)
+                        ds = int_p + debt_bal
+                        prin = debt_bal
+                        debt_bal = 0
+                    elif ann_ds > max_ds_dscr:
+                        # DSCR 위반: 상환 축소 (Aug 년 등)
+                        # 단, 이자는 무조건 지불
+                        actual_ds = max(int_p, max_ds_dscr)
+                        prin = max(0, actual_ds - int_p)
+                        ds = actual_ds
+                        debt_bal = max(0, debt_bal - prin)
+                    else:
+                        # 정상: level amort
+                        ds = ann_ds
+                        prin = level_principal
+                        debt_bal = max(0, debt_bal - prin)
+                else:
+                    # Level amort (Sculpted 꺼짐 or Partnership CF ≤ 0)
+                    ds = ann_ds
+                    prin = level_principal
+                    debt_bal = max(0, debt_bal - prin)
+            elif debt_bal > 0 and yr == loan_term + 1:
+                # loan_term 지났는데 debt 남음 (sculpted 축소분 잔여) → balloon
+                int_p = debt_bal * int_rate
+                ds = int_p + debt_bal
+                prin = debt_bal
+                debt_bal = 0
+            else:
+                ds = 0
+
+        # DSCR tracking (output용)
+        dscr_yr = partnership_cf / ds if ds > 0 else None
+        debt_schedule.append({
+            'yr': yr,
+            'interest': round(int_p, 0),
+            'principal': round(prin, 0),
+            'ds': round(ds, 0),
+            'debt_bal_end': round(debt_bal, 0),
+            'dscr': round(dscr_yr, 3) if dscr_yr else None,
+        })
 
         # MACRS depreciation tax benefit
         # Neptune NOL 이월 효과로 Y1-Y9 tax benefit이 Partnership tax와 상쇄 (R42 + R33 ≈ 0)
@@ -745,6 +813,15 @@ def _calc_engine(inputs: dict) -> dict:
         'te_cashflows':  [round(x, 0) for x in te_cfs_final[:11]],
         'bonus_depr_pct': round(bonus_rate * 100, 1),
         'macrs_basis':   round(macrs_basis, 0),
+        # PHASE C: Debt Service + DSCR tracking
+        'debt_schedule': debt_schedule[:15],
+        'dscr_min':      round(min([d['dscr'] for d in debt_schedule if d['dscr'] is not None], default=0), 3),
+        'dscr_avg':      round(
+                            sum([d['dscr'] for d in debt_schedule if d['dscr'] is not None]) /
+                            max(1, len([d for d in debt_schedule if d['dscr'] is not None])),
+                         3) if any(d['dscr'] is not None for d in debt_schedule) else None,
+        'dscr_target_used': dscr_target,
+        'debt_sculpted': bool(use_sculpted_dscr and not is_calibration),
         'credit_mode':   credit_mode,
         'pv_itc_rate':   round(pv_itc_rate*100, 2),
         'bess_itc_rate': round(bess_itc_rate*100, 2),
