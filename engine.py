@@ -276,11 +276,43 @@ def _calc_engine(inputs: dict) -> dict:
     # Dev Margin 최종 값 저장 (output에 노출)
     computed_dev_margin_k = dev_margin_k
 
-    # MACRS depreciation
+    # MACRS depreciation + Bonus Depreciation (Phase B)
     tax_rate    = inputs.get('tax_rate', 21) / 100
+    # ITC basis step-up rule: ITC 있으면 depreciable basis × (1 - ITC/2)
+    # IRS Section 50(c)(3): ITC 받으면 basis 50% 감소
     macrs_basis = total_capex * itc_elig * (1 - itc_rate/2)
-    depr_sched  = {i+1: macrs_basis*r for i,r in enumerate(MACRS_5YR)}
-    
+
+    # ═══ Bonus Depreciation (TCJA § 168(k) Phase-out) ═══
+    # Y1에 적격 자산의 일정 %를 즉시 감가상각, 나머지를 MACRS 5년 분산
+    # 
+    # Phase-out schedule by Placed-In-Service (COD) year:
+    #   2023: 80% / 2024: 60% / 2025: 40% / 2026: 20% / 2027+: 0%
+    # 
+    # Prediction 모드 기본값: COD year 기반 자동 결정
+    # 사용자 override: inputs['bonus_depr_pct'] (0-100)
+    # Calibration 모드: Neptune 재현 → 강제 0% (standard MACRS 5yr만)
+    if is_calibration:
+        bonus_rate = 0.0
+    else:
+        bonus_override = inputs.get('bonus_depr_pct', None)
+        if bonus_override is not None:
+            bonus_rate = bonus_override / 100 if bonus_override > 1 else bonus_override
+        else:
+            cod_year_default = int(inputs.get('cod_year', 2026))
+            bonus_map = {
+                2023: 0.80, 2024: 0.60, 2025: 0.40,
+                2026: 0.20, 2027: 0.0,
+            }
+            bonus_rate = bonus_map.get(cod_year_default, 0.0)
+
+    # Bonus 적용: Y1에 bonus × basis + (1 - bonus) × basis를 MACRS 5년 분산
+    bonus_amount = macrs_basis * bonus_rate
+    remaining_basis = macrs_basis * (1 - bonus_rate)
+    depr_sched = {i+1: remaining_basis * r for i, r in enumerate(MACRS_5YR)}
+    # Y1에 bonus 추가
+    if bonus_rate > 0:
+        depr_sched[1] = depr_sched.get(1, 0) + bonus_amount
+
     # Depreciation share — Partnership Flip 구조에 따라 다름
     # Prediction mode 기본값:
     #   Pre-flip: TE가 depr 99% → Sponsor depr_share = 1%
@@ -359,8 +391,144 @@ def _calc_engine(inputs: dict) -> dict:
     # Unlevered IRR 계산에는 포함 안 함 (엑셀 실측 일치)
     unlev_y0 = -construction_cost + te_proceeds
 
+    # ═══════════════════════════════════════════════════════════════════
+    # PHASE A — Dynamic Flip Year Calculation (Prediction 모드 전용)
+    # ═══════════════════════════════════════════════════════════════════
+    # 표준 Partnership Flip 구조에서 Flip trigger는 고정된 연수가 아니라
+    # "Tax Equity가 target yield (flip_yield, default 8.75%) 달성하는 시점"
+    # 
+    # Pass 1: pre-flip 비율 (99/1) 기준으로 TE cashflow 시뮬레이션
+    #   - Y0: -te_invest + Y0 ITC tax benefit (전액 TE 귀속)
+    #   - Y1~: TE cash (partnership_cf × 99%) + TE tax (MACRS × 99%)
+    #   - 매년 NPV(flip_yield) 체크 → ≥ 0 첫 해 = flip_year
+    # 
+    # 이는 수학적으로 TE IRR ≥ flip_yield 와 동치 (Newton-Raphson 생략)
+    # 
+    # Safety rails:
+    #   - min_flip_year (default 3): 너무 빠른 flip 방지
+    #   - max_flip_year (default 15): target 달성 못 해도 강제 flip
+    #   - te_invest == 0: 로직 skip (division by zero 방지)
+    # 
+    # Calibration 모드는 dynamic_flip=False → 기존 flip_term 고정값 유지
+    #   (Neptune 10.14% 재현 보호)
+    # 
+    # 사용자가 명시적으로 flip_term_override 시 존중
+    # 
+    # 참고: IRS Partnership Flip 표준 구조
+    #   - HLBV (Hypothetical Liquidation Book Value) 기반 flip
+    #   - ITC Safe Harbor: 5 years (Y0+4), MACRS 5년 일치
+    #   - 산업 평균 flip year: 5-8년
+    # ═══════════════════════════════════════════════════════════════════
+    # Schedule inputs (annual loop 밖에서도 접근 필요 for Pass 1)
+    pv_sched   = inputs.get('pv_rev_schedule', [])
+    bess_sched = inputs.get('bess_rev_schedule', [])
+    merch_sched= inputs.get('merch_rev_schedule', [])
+
+    dynamic_flip = inputs.get('dynamic_flip', not is_calibration)
+    max_flip_year = int(inputs.get('max_flip_year', 15))
+    min_flip_year = int(inputs.get('min_flip_year', 3))
+    user_flip_override = inputs.get('flip_term_override')
+
+    if user_flip_override is not None:
+        # 사용자 명시 override
+        actual_flip_year = int(user_flip_override)
+    elif dynamic_flip and te_invest > 0 and not is_calibration:
+        # Pass 1: TE CF 시뮬레이션 (pre-flip 99/1 기준)
+        # Y0 ITC tax benefit: 전액 TE 귀속 (표준 구조)
+        itc_y0_te = 0
+        if credit_mode == 'ITC':
+            itc_y0_te = total_capex * itc_elig * effective_itc_rate
+        te_cfs_sim = [-te_invest + itc_y0_te]
+
+        found_flip = False
+        debt_bal_sim = debt
+        for yr_s in range(1, life + 1):
+            # Revenue (annual loop과 동일 로직)
+            avail_s = avail_1 if yr_s == 1 else avail_2
+            prod_s = ann_prod_yr1 * avail_s * ((1-degradation)**(yr_s-1))
+            if pv_sched and yr_s-1 < len(pv_sched):
+                pv_rev_s = pv_sched[yr_s-1]
+            elif yr_s <= ppa_term:
+                pv_rev_s = prod_s * ppa_price * ((1+ppa_esc)**(yr_s-1)) / 1000
+            else:
+                merch_yr_s = yr_s - ppa_term
+                pv_rev_s = prod_s * merch_ppa * ((1+merch_esc)**(merch_yr_s-1)) / 1000
+            if bess_sched and yr_s-1 < len(bess_sched):
+                bess_rev_s = bess_sched[yr_s-1]
+            else:
+                bess_rev_s = (bess_mw*1000*bess_toll*((1+bess_toll_esc)**(yr_s-1))
+                              * bess_months_per_yr / 1000 if yr_s <= bess_toll_t else 0)
+            if merch_sched and yr_s-1 < len(merch_sched) and merch_sched[yr_s-1] > 0:
+                pv_rev_s = merch_sched[yr_s-1]
+            total_rev_s = pv_rev_s + bess_rev_s
+
+            # OPEX
+            esc_s = (1+opex_esc)**(yr_s-1)
+            prop_esc_s = max(0.35, 1 - 0.025*(yr_s-1))
+            opex_s = (pv_mwdc*1000*pv_om/1000*esc_s + pv_mwac*1000*pv_om_nc/1000*esc_s +
+                      pv_mwac*1000*pv_aux/1000*esc_s + bess_mw*1000*bess_om/1000*esc_s +
+                      bess_mw*1000*bess_om_nc/1000*esc_s + bess_mw*1000*bess_aux/1000*esc_s +
+                      pv_mwac*1000*ins_pv/1000*esc_s + bess_mw*1000*ins_bess/1000*esc_s +
+                      asset_mgmt*esc_s + prop_tax*prop_esc_s + land_rent*esc_s + opex_etc*1000*esc_s)
+            ebitda_s = total_rev_s - opex_s
+            aug_c_s = aug_cost_ea if yr_s in aug_years else 0
+            partnership_cf_s = ebitda_s - aug_c_s
+
+            # Debt service (Prediction: level amortization)
+            if yr_s <= loan_term and debt_bal_sim > 0:
+                int_p_s = debt_bal_sim * int_rate
+                prin_s = max(0, ann_ds - int_p_s)
+                ds_s = ann_ds
+                debt_bal_sim = max(0, debt_bal_sim - prin_s)
+            else:
+                ds_s = 0
+
+            # TE CF (pre-flip 기준)
+            op_cf_s = partnership_cf_s - ds_s
+            te_cash_s = op_cf_s * pre_flip_cash_te  # TE 99%
+            depr_s = depr_sched.get(yr_s, 0)
+            # MACRS tax benefit: TE가 (1 - depr_share_pre) = 99%
+            te_depr_s = depr_s * tax_rate * (1 - depr_share_pre)
+            # PTC (TE share, applicable years only)
+            te_ptc_s = 0
+            if credit_mode == 'PTC' and yr_s <= 10:
+                te_ptc_s = prod_s * ptc_rate_per_kwh * (1 - depr_share_pre)
+            te_cf_s_total = te_cash_s + te_depr_s + te_ptc_s
+            te_cfs_sim.append(te_cf_s_total)
+
+            # Flip trigger check: NPV at flip_yield
+            if yr_s >= min_flip_year:
+                te_npv_check = sum(cf / (1+flip_yield)**t for t, cf in enumerate(te_cfs_sim))
+                if te_npv_check >= 0:
+                    actual_flip_year = yr_s
+                    found_flip = True
+                    break
+            # Max flip year safety
+            if yr_s >= max_flip_year:
+                actual_flip_year = yr_s
+                found_flip = True
+                break
+
+        if not found_flip:
+            # Loop 끝까지 target 달성 안 되면 max_flip_year 강제 적용
+            actual_flip_year = min(max_flip_year, life)
+    else:
+        # Calibration mode or dynamic disabled: 기존 flip_term 고정값 유지
+        actual_flip_year = flip_term
+
     cashflows=[-effective_eq]; unlev_cfs=[unlev_y0]
     sponsor_cfs=[-sponsor_y0_cash]; pretax_cfs=[-sponsor_y0_cash]
+
+    # PHASE B — TE Cashflow stream 추적 (TE IRR 계산용)
+    # Y0: TE 투자 - ITC 수령 (Prediction 모드에서 TE가 ITC 전액 귀속)
+    # Calibration 모드: 기존 Neptune Y0 cash 구조 유지 (별도 추적 안 함)
+    if not is_calibration:
+        itc_y0_te_bnft = total_capex * itc_elig * effective_itc_rate if credit_mode == 'ITC' else 0
+        te_cfs_final = [-te_invest + itc_y0_te_bnft]
+    else:
+        # Calibration: Neptune 구조 (TE IRR는 보조 지표로만)
+        te_cfs_final = [-te_invest]
+
     debt_bal=debt; detail=[]; ebitda_yr1=None
 
     for yr in range(1, life+1):
@@ -368,10 +536,7 @@ def _calc_engine(inputs: dict) -> dict:
         prod  = ann_prod_yr1 * avail * ((1-degradation)**(yr-1))
 
         # CF_Annual parsed schedule 우선 사용 (실제 Neptune 모델값)
-        pv_sched   = inputs.get('pv_rev_schedule', [])
-        bess_sched = inputs.get('bess_rev_schedule', [])
-        merch_sched= inputs.get('merch_rev_schedule', [])
-
+        # (pv_sched/bess_sched/merch_sched는 위에서 이미 정의됨)
         if pv_sched and yr-1 < len(pv_sched):
             pv_rev = pv_sched[yr-1]
         elif yr <= ppa_term:
@@ -441,7 +606,9 @@ def _calc_engine(inputs: dict) -> dict:
         # Prediction mode 기본 False (MACRS tax benefit 정상 반영)
         use_nol_offset = inputs.get('use_nol_offset', is_calibration)
         # flip year 기반 Sponsor depr share (pre/post flip)
-        current_depr_share = depr_share_pre if yr <= flip_term else depr_share_post
+        # Prediction: actual_flip_year = dynamic (Phase A)
+        # Calibration: actual_flip_year = flip_term 고정 (Neptune 재현)
+        current_depr_share = depr_share_pre if yr <= actual_flip_year else depr_share_post
         if use_nol_offset:
             s_tax = 0  # NOL로 상쇄
         else:
@@ -455,23 +622,51 @@ def _calc_engine(inputs: dict) -> dict:
             s_tax += ptc_benefit * current_depr_share
 
         op_cf = ebitda - ds - aug_c
-        # ── Sponsor CF: Neptune Returns Row 25 방식 ──
-        # Row 25 = Row 19 (Partnership) - Row 21 (Debt net) - Row 22 (TE dist) + Row 23 (Pay-Go)
-        # TE distribution은 Partnership CF에 비례 (Debt와 독립)
-        # 이전 엔진은 op_cf × (1-TE%) 로 계산했으나, 이는 Debt 영향을 TE 배분에 섞음 → 교정
-        te_cash_pct = pre_flip_cash_te if yr <= flip_term else post_flip_cash_te
-        te_dist_cash = partnership_cf * te_cash_pct
-        s_cf = partnership_cf - ds - te_dist_cash + s_tax
+        # ── Sponsor CF 분배 ──
+        #
+        # Calibration 모드 (Neptune 재현):
+        #   TE dist = Partnership CF × TE% (Pay-Go 또는 hybrid 구조 추정)
+        #   Sponsor = Partnership CF - Debt Service - TE dist + Tax benefit
+        #   → Debt와 TE dist를 둘 다 Partnership CF에서 뺌
+        #   → TE%가 낮아야 (9.2%) 성립하는 구조
+        #
+        # Prediction 모드 (업계 표준 Partnership Flip):
+        #   Debt는 Partnership 레벨에서 상환 (Debt holder 우선)
+        #   Op CF = Partnership CF - Debt Service
+        #   TE dist = Op CF × TE%
+        #   Sponsor = Op CF × (1 - TE%) + Tax benefit
+        #   → TE%가 높아도 (99%) Debt 이중 차감 문제 없음
+        te_cash_pct = pre_flip_cash_te if yr <= actual_flip_year else post_flip_cash_te
+
+        if is_calibration:
+            # Neptune 구조 (기존 로직 보존)
+            te_dist_cash = partnership_cf * te_cash_pct
+            s_cf = partnership_cf - ds - te_dist_cash + s_tax
+            s_cf_pretax = partnership_cf - ds - te_dist_cash
+        else:
+            # 업계 표준 Partnership Flip
+            op_cf_for_split = partnership_cf - ds  # Debt 먼저 갚음
+            te_dist_cash = op_cf_for_split * te_cash_pct
+            s_cf = op_cf_for_split * (1 - te_cash_pct) + s_tax
+            s_cf_pretax = op_cf_for_split * (1 - te_cash_pct)
 
         # Flip Year event: TE buyout 직후 Sponsor 일시 대금 수령
-        if yr == flip_term + 1 and flip_event_cf > 0:
+        if yr == actual_flip_year + 1 and flip_event_cf > 0:
             s_cf += flip_event_cf
 
-        s_cf_pretax = partnership_cf - ds - te_dist_cash
+        # PHASE B — TE Cashflow 추적 (실제 TE가 받는 금액)
+        # TE cash dist + TE tax benefit (MACRS × TE depr share) + TE PTC (if applicable)
+        te_depr_share_yr = 1 - current_depr_share  # TE는 Sponsor의 반대
+        te_tax_benefit = depr * tax_rate * te_depr_share_yr
+        te_ptc_benefit = 0
+        if credit_mode == 'PTC' and yr <= 10:
+            te_ptc_benefit = prod * ptc_rate_per_kwh * te_depr_share_yr
+        te_cf_yr = te_dist_cash + te_tax_benefit + te_ptc_benefit
+        te_cfs_final.append(te_cf_yr)
 
         # Unlevered aftertax CF (Neptune R51 구조):
         # = Partnership CF - TE distribution (Debt 제외한 Sponsor+TE 관점)
-        # TE dist 비율은 위 Sponsor CF와 동일한 te_cash_pct 사용 (일관성)
+        # Unlev는 Partnership 전체 관점이라 Partnership CF 기준 TE 분배 유지
         te_dist_unlev = partnership_cf * te_cash_pct
         unlev_aftertax_cf = partnership_cf - te_dist_unlev + (ptc_benefit if credit_mode == 'PTC' and yr <= 10 else 0)
 
@@ -484,6 +679,8 @@ def _calc_engine(inputs: dict) -> dict:
     lirr = _irr_robust(pretax_cfs, guess=0.10)   # Sponsor pretax levered (Neptune Row 26 ~10%)
     uirr = _irr_robust(unlev_cfs, guess=0.05)    # Asset-level unlevered (Neptune Row 27 ~8%)
     sirr = _irr_robust(sponsor_cfs, guess=0.10)  # Sponsor after-tax w/ MACRS (Full Life)
+    # PHASE B — TE IRR (Tax Equity 투자자 관점 IRR)
+    te_irr = _irr_robust(te_cfs_final, guess=flip_yield) if te_invest > 0 else None
     try:
         sirr_c = float(npf.irr(sponsor_cfs[:ppa_term+1]))
         if np.isnan(sirr_c): sirr_c = None
@@ -540,6 +737,14 @@ def _calc_engine(inputs: dict) -> dict:
         'ebitda_yield':  round(ebitda_yield,2),
         'aug_cost_ea':   round(aug_cost_ea,0),
         'life_yrs':      life,
+        'flip_year':     int(actual_flip_year),
+        'flip_year_dynamic': bool(dynamic_flip and not is_calibration and user_flip_override is None),
+        'flip_year_fixed_fallback': int(flip_term),
+        # PHASE B: Tax Equity 관련 출력
+        'te_irr':        round(te_irr, 6) if (te_irr is not None and not np.isnan(te_irr)) else None,
+        'te_cashflows':  [round(x, 0) for x in te_cfs_final[:11]],
+        'bonus_depr_pct': round(bonus_rate * 100, 1),
+        'macrs_basis':   round(macrs_basis, 0),
         'credit_mode':   credit_mode,
         'pv_itc_rate':   round(pv_itc_rate*100, 2),
         'bess_itc_rate': round(bess_itc_rate*100, 2),
