@@ -16,6 +16,7 @@ Generated: Apr 20, 2026
 """
 
 import base64
+import datetime
 
 def _esc_html(s):
     """HTML escape helper."""
