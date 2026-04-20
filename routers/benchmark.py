@@ -143,7 +143,7 @@ def get_market_benchmark(force: int = 0, user=Depends(get_current_user)):
                 pass
 
     if not FRED_API_KEY:
-        raise HTTPException(500, "FRED_API_KEY 환경변수 미설정")
+        raise HTTPException(500, "FRED_API_KEY environment variable not set")
 
     result = {
         "fetched_at": datetime.datetime.utcnow().isoformat()[:19],
@@ -197,7 +197,7 @@ async def upload_levelten(
 ):
     """LevelTen PPA Index 리포트 업로드 → Claude API로 파싱 → Firebase 저장."""
     if not ANTHROPIC_KEY:
-        raise HTTPException(500, "ANTHROPIC_API_KEY 환경변수 미설정")
+        raise HTTPException(500, "ANTHROPIC_API_KEY environment variable not set")
 
     raw = await file.read()
     filename = file.filename or "levelten.pdf"
@@ -238,7 +238,7 @@ async def upload_levelten(
                 try:
                     from openpyxl import load_workbook
                 except ImportError:
-                    raise HTTPException(400, "openpyxl이 설치되지 않았습니다. requirements.txt에 추가하세요.")
+                    raise HTTPException(400, "openpyxl is not installed. Add it to requirements.txt.")
                 wb = load_workbook(tmp_path, data_only=True, read_only=True)
                 lines = []
                 for sheet_name in wb.sheetnames[:5]:
@@ -251,7 +251,7 @@ async def upload_levelten(
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(400, f"Excel 파싱 실패: {str(e)}")
+            raise HTTPException(400, f"Excel parsing failed: {str(e)}")
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try: os.unlink(tmp_path)
@@ -365,7 +365,7 @@ async def upload_levelten(
             res = requests.post("https://api.anthropic.com/v1/messages",
                                 headers=headers, json=body, timeout=150)
             if res.status_code != 200:
-                raise HTTPException(502, f"Claude API 오류: {res.text[:300]}")
+                raise HTTPException(502, f"Claude API error: {res.text[:300]}")
             ai_text = res.json()["content"][0]["text"].strip()
             if ai_text.startswith("```"):
                 ai_text = ai_text.split("```", 2)[1]
@@ -375,11 +375,11 @@ async def upload_levelten(
         except HTTPException:
             raise
         except requests.Timeout:
-            raise HTTPException(504, "Claude API 응답 타임아웃 — 리포트가 너무 크거나 서버 혼잡 (재시도 권장)")
+            raise HTTPException(504, "Claude API response timeout — report may be too large or server busy (retry recommended)")
         except json.JSONDecodeError as e:
-            raise HTTPException(500, f"AI 응답 JSON 파싱 실패: {str(e)}")
+            raise HTTPException(500, f"Failed to parse AI response JSON: {str(e)}")
     else:
-        raise HTTPException(400, f"지원하지 않는 파일 형식: .{ext} (PDF, CSV, XLSX, XLSB 지원)")
+        raise HTTPException(400, f"Unsupported file format: .{ext} (supported: PDF, CSV, XLSX, XLSB)")
 
     # CSV/Excel인 경우 Claude에게 텍스트 파싱 요청
     if parse_mode in ("csv", "excel"):
@@ -421,7 +421,7 @@ async def upload_levelten(
             res = requests.post("https://api.anthropic.com/v1/messages",
                                 headers=headers, json=body, timeout=150)
             if res.status_code != 200:
-                raise HTTPException(502, f"Claude API 오류: {res.text[:300]}")
+                raise HTTPException(502, f"Claude API error: {res.text[:300]}")
             ai_text = res.json()["content"][0]["text"].strip()
             if ai_text.startswith("```"):
                 ai_text = ai_text.split("```", 2)[1]
@@ -431,17 +431,17 @@ async def upload_levelten(
         except HTTPException:
             raise
         except requests.Timeout:
-            raise HTTPException(504, "Claude API 응답 타임아웃 — 리포트가 너무 크거나 서버 혼잡 (재시도 권장)")
+            raise HTTPException(504, "Claude API response timeout — report may be too large or server busy (retry recommended)")
         except json.JSONDecodeError as e:
-            raise HTTPException(500, f"AI 응답 JSON 파싱 실패: {str(e)}")
+            raise HTTPException(500, f"Failed to parse AI response JSON: {str(e)}")
 
     if not parsed:
-        raise HTTPException(500, "파싱 결과가 비어있습니다.")
+        raise HTTPException(500, "Parsing result is empty.")
 
     # 쿼터 형식 검증 (YYYY-QN)
     import re
     if not re.match(r'^\d{4}-Q[1-4]$', quarter.upper()):
-        raise HTTPException(400, "쿼터 형식은 YYYY-Q1 ~ YYYY-Q4 여야 합니다.")
+        raise HTTPException(400, "Quarter format must be YYYY-Q1 ~ YYYY-Q4.")
     quarter = quarter.upper()
 
     # 쿼터 덮어쓰기 (사용자가 명시한 값이 우선)
@@ -500,14 +500,14 @@ def delete_levelten(quarter: str, user=Depends(require_admin)):
     """특정 분기 LevelTen 데이터 삭제."""
     import re
     if not re.match(r'^\d{4}-Q[1-4]$', quarter.upper()):
-        raise HTTPException(400, "쿼터 형식은 YYYY-Q1 ~ YYYY-Q4 여야 합니다.")
+        raise HTTPException(400, "Quarter format must be YYYY-Q1 ~ YYYY-Q4.")
     quarter = quarter.upper()
     try:
         requests.delete(f"{FB_URL}/benchmark/levelten/{quarter}.json",
                         params=fb_auth_param(), timeout=5)
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(500, f"삭제 오류: {str(e)}")
+        raise HTTPException(500, f"Delete error: {str(e)}")
 
 
 # ── 피어 IRR 벤치마크 (내부 수동 입력값) ────────────
@@ -526,18 +526,18 @@ def save_peer_irr(payload: dict, user=Depends(get_current_user)):
     for k in required_numeric:
         v = payload.get(k)
         if v is None:
-            raise HTTPException(400, f"누락된 필드: {k}")
+            raise HTTPException(400, f"Missing field: {k}")
         try:
             fv = float(v)
             if fv < 0 or fv > 50:
-                raise HTTPException(400, f"{k}: 0~50% 범위여야 합니다.")
+                raise HTTPException(400, f"{k}: must be in range 0~50%.")
             data[k] = round(fv, 2)
         except (ValueError, TypeError):
-            raise HTTPException(400, f"{k}: 숫자여야 합니다.")
+            raise HTTPException(400, f"{k}: must be a number.")
     # min < max 검증
     for tech in ("solar", "hybrid", "wind"):
         if data[f"{tech}_min"] >= data[f"{tech}_max"]:
-            raise HTTPException(400, f"{tech}: min < max 이어야 합니다.")
+            raise HTTPException(400, f"{tech}: min must be less than max.")
     # 비고
     note = payload.get("note", "")
     if isinstance(note, str):
@@ -559,7 +559,7 @@ def research_bess_tolling(user=Depends(get_current_user)):
     캐시: benchmark/bess_tolling/latest (수동 새로고침)
     """
     if not ANTHROPIC_KEY:
-        raise HTTPException(500, "ANTHROPIC_API_KEY 미설정")
+        raise HTTPException(500, "ANTHROPIC_API_KEY not set")
 
     today_str = datetime.date.today().isoformat()
 
@@ -617,8 +617,8 @@ def research_bess_tolling(user=Depends(get_current_user)):
         "- SECONDARY (LevelTen-covered, provide duration breakdown only):\n"
         "    ERCOT, CAISO, PJM, MISO, SPP, AESO\n\n"
         "TARGET DURATIONS for each region: 2h, 4h, 6h\n\n"
-        "Output: ALL text fields (market_note, methodology_note, caveats) MUST BE IN KOREAN.\n"
-        "Use formal nominal/concise style ('~확인됨', '~추정됨', '~범위').\n"
+        "Output: ALL text fields (market_note, methodology_note, caveats) MUST BE IN ENGLISH.\n"
+        "Use concise, professional analyst style ('~confirmed', '~estimated', '~range').\n"
         "For WECC_* regions, market_note MUST include PPA market commentary (utility RFP landscape, "
         "recent clearing prices, Neptune-like Utah projects context).\n"
         "Numbers stay numeric ($X/kW-mo). Region names stay English.\n\n"
@@ -628,21 +628,21 @@ def research_bess_tolling(user=Depends(get_current_user)):
         '  "iso_data": [\n'
         '    {\n'
         '      "region": "ERCOT|CAISO|PJM|MISO|SPP|AESO|ISO-NE|NYISO|WECC_DSW|WECC_RM|WECC_NW|SERC",\n'
-        '      "levelten_covered": true,  // 6 LevelTen ISOs=true, 나머지 4 (ISO-NE/NYISO/WECC_*/SERC)=false\n'
+        '      "levelten_covered": true,  // 6 LevelTen ISOs=true, others (ISO-NE/NYISO/WECC_*/SERC)=false\n'
         '      "durations": [\n'
         '        {"hours": 2, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"},\n'
         '        {"hours": 4, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"},\n'
         '        {"hours": 6, "p25": <number>, "p75": <number>, "confidence": "high|medium|low"}\n'
         '      ],\n'
-        '      "market_note": "(한국어) 시장 특성 1-2문장. WECC_*는 PPA 시장 commentary 포함 (주요 utility RFP, recent clearing prices, 인접 주 벤치마크)",\n'
+        '      "market_note": "(English) 1-2 sentences on market characteristics. For WECC_*, include PPA market commentary (key utility RFPs, recent clearing prices, benchmarks from neighboring states)",\n'
         '      "sources": [\n'
-        '        {"url": "https://...", "title": "source title", "date": "YYYY-MM", "key_data": "핵심 수치/인용 (한국어 번역 OK)"}\n'
+        '        {"url": "https://...", "title": "source title", "date": "YYYY-MM", "key_data": "key figures / quote"}\n'
         '      ]\n'
         '    }\n'
         '  ],\n'
-        '  "methodology_note": "(한국어) 추정 방법 요약. LevelTen 공식 index와의 관계 명시: LevelTen은 6개 ISO만 커버, 본 리서치는 (1) 미커버 4개 지역(ISO-NE/NYISO/WECC_DSW/WECC_RM/WECC_NW/SERC) 보완, (2) 전체 duration별(2h/4h/6h) 세분화 목표. capacity market + merchant 수익 + utility RFP 삼각 검증",\n'
+        '  "methodology_note": "(English) Brief summary of estimation method. Explicitly state relationship to LevelTen official index: LevelTen covers 6 ISOs only; this research complements by (1) filling 6 uncovered regions (ISO-NE, NYISO, WECC_DSW, WECC_RM, WECC_NW, SERC), (2) providing duration-level breakdown (2h/4h/6h) across all regions. Triangulates capacity market + merchant revenue + utility RFP data.",\n'
         '  "confidence_overall": "high|medium|low",\n'
-        '  "caveats": "(한국어) 1-2문장. 예: 본 수치는 AI 리서치 기반 추정치. LevelTen 6개 ISO는 공식 데이터 우선. WECC sub-region 및 SERC는 공식 index 부재 — RFP/IRP 참고치"\n'
+        '  "caveats": "(English) 1-2 sentences. Example: These figures are AI-research-based estimates. For the 6 LevelTen-covered ISOs, official data takes precedence. WECC sub-regions and SERC lack official indices — estimates rely on RFP/IRP references."\n'
         "}\n\n"
         "Rules:\n"
         "- All prices in USD/kW-month, levelized over contract term.\n"
@@ -652,7 +652,7 @@ def research_bess_tolling(user=Depends(get_current_user)):
         "- Confidence guide: 'high' if 3+ sources corroborate; 'medium' if 1-2 sources; 'low' if benchmark/inference only.\n"
         "- For WECC_* regions, market_note MUST include PPA context (not just BESS) — target utilities and recent RFP clearing prices.\n"
         "- Dates must be 2024-2026 (recent only).\n"
-        "- All text fields in Korean formal nominal style.\n"
+        "- All text fields in English, professional analyst style.\n"
         "- Return valid JSON only."
     )
 
@@ -677,7 +677,7 @@ def research_bess_tolling(user=Depends(get_current_user)):
             timeout=180,  # 웹서치 여러 번 → 최대 3분
         )
         if resp.status_code != 200:
-            raise HTTPException(502, f"Claude API 오류: {resp.text[:400]}")
+            raise HTTPException(502, f"Claude API error: {resp.text[:400]}")
 
         data = resp.json()
         # content blocks 중 text 타입만 합쳐서 JSON 파싱
@@ -693,13 +693,13 @@ def research_bess_tolling(user=Depends(get_current_user)):
         start = clean.find("{")
         end = clean.rfind("}") + 1
         if start < 0 or end <= start:
-            raise HTTPException(500, f"AI 응답에서 JSON을 찾을 수 없음: {full_text[:300]}")
+            raise HTTPException(500, f"No JSON found in AI response: {full_text[:300]}")
         clean = clean[start:end]
 
         try:
             parsed = json.loads(clean)
         except json.JSONDecodeError as e:
-            raise HTTPException(500, f"JSON 파싱 실패: {str(e)}. 응답: {clean[:400]}")
+            raise HTTPException(500, f"JSON parsing failed: {str(e)}. Response: {clean[:400]}")
 
         # 메타데이터 추가
         parsed["generated_at"] = datetime.datetime.utcnow().isoformat()[:19]
@@ -723,9 +723,9 @@ def research_bess_tolling(user=Depends(get_current_user)):
     except HTTPException:
         raise
     except requests.Timeout:
-        raise HTTPException(504, "AI 리서치 타임아웃 (3분 초과)")
+        raise HTTPException(504, "AI research timeout (exceeded 3 minutes)")
     except Exception as e:
-        raise HTTPException(500, f"BESS 리서치 실패: {str(e)}")
+        raise HTTPException(500, f"BESS research failed: {str(e)}")
 
 
 @router.get("/benchmark/bess-tolling")
