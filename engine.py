@@ -556,6 +556,36 @@ def _calc_engine(inputs: dict) -> dict:
     cashflows=[-effective_eq]; unlev_cfs=[unlev_y0]
     sponsor_cfs=[-sponsor_y0_cash]; pretax_cfs=[-sponsor_y0_cash]
 
+    # ═══════════════════════════════════════════════════════════════════
+    # PHASE F — 5 IRR 카드 동시 계산용 새 cash flow stream (2026-05-01)
+    # ═══════════════════════════════════════════════════════════════════
+    # 기존 sponsor_cfs는 mode 분기 결과 (Calibration: NOL offset / Prediction: Immediate)
+    # 새 stream 3개는 mode와 무관하게 항상 두 시나리오 동시 계산:
+    #
+    #   sponsor_immediate_cfs: Mode B (Immediate benefit, 대기업 Sponsor)
+    #     - MACRS tax shield 즉시 활용 가정
+    #     - HDOS UI "AT Before NOL" 카드용
+    #     - Excel 매핑: Family A R40 (Sponsor net aftertax cashflow, NOL 적용 전)
+    #
+    #   sponsor_nol_carry_cfs: Mode C (NOL Carryforward, SPV)
+    #     - IRS Section 172(a)(2) 80% rule
+    #     - HDOS UI "AT After NOL" 카드용
+    #     - Excel 매핑: Family A R45 (Sponsor net aftertax cashflow, NOL 적용 후)
+    #
+    #   unlev_pretax_cfs: Sponsor unlevered pre-tax
+    #     - Debt 효과 X, tax 효과 X
+    #     - HDOS UI "Unlevered Pre-Tax" 카드용
+    #     - Excel 매핑: Family A R27 (Sponsor net unlevered pretax cashflow)
+    #
+    # 기존 lirr/uirr/sirr 그대로 유지 (backward compat)
+    # 새 4 IRR은 sponsor_irr_levered_pretax / aftertax_before_nol / 
+    # aftertax_after_nol / unlevered_pretax 로 추가 노출
+    # ═══════════════════════════════════════════════════════════════════
+    sponsor_immediate_cfs = [-sponsor_y0_cash]   # AT Before NOL (Mode B)
+    sponsor_nol_carry_cfs = [-sponsor_y0_cash]   # AT After NOL (Mode C)
+    unlev_pretax_cfs = [unlev_y0]                # Unlevered Pre-Tax
+    nol_balance_carry = 0                         # Mode C 별도 trace (mainline nol_balance와 분리)
+
     # PHASE B — TE Cashflow stream 추적 (TE IRR 계산용)
     # Y0: TE 투자 - ITC 수령 (Prediction 모드에서 TE가 ITC 전액 귀속)
     # Calibration 모드: 기존 Neptune Y0 cash 구조 유지 (별도 추적 안 함)
@@ -818,6 +848,43 @@ def _calc_engine(inputs: dict) -> dict:
         unlev_aftertax_cf = partnership_cf + (ptc_benefit if credit_mode == 'PTC' and yr <= 10 else 0)
 
         cashflows.append(op_cf); unlev_cfs.append(unlev_aftertax_cf); sponsor_cfs.append(s_cf); pretax_cfs.append(s_cf_pretax)
+
+        # ═══════════════════════════════════════════════════════════════
+        # PHASE F — 5 IRR 카드 동시 계산 (2026-05-01)
+        # 기존 s_cf 로직과 별도로 두 mode + unlev_pretax 항상 계산
+        # ═══════════════════════════════════════════════════════════════
+
+        # Mode B: Immediate benefit (대기업 Sponsor — MACRS 즉시 활용)
+        s_tax_immediate = depr * tax_rate * current_depr_share + sponsor_ptc
+        s_cf_immediate = s_cf_pretax + s_tax_immediate
+        # Flip event cash 동일 처리
+        if yr == actual_flip_year + 1 and flip_event_cf > 0:
+            s_cf_immediate += flip_event_cf
+        sponsor_immediate_cfs.append(s_cf_immediate)
+
+        # Mode C: NOL Carryforward (SPV 가정 — IRS Sec 172(a)(2) 80% rule)
+        sponsor_taxable_before_depr_carry = (partnership_cf - int_p) * (1 - te_cash_pct)
+        sponsor_depr_deduct_carry = depr * current_depr_share
+        sponsor_taxable_carry = sponsor_taxable_before_depr_carry - sponsor_depr_deduct_carry
+        if sponsor_taxable_carry < 0:
+            nol_balance_carry += abs(sponsor_taxable_carry)
+            s_tax_nol_carry = sponsor_ptc
+        else:
+            offset_carry = min(sponsor_taxable_carry * 0.80, nol_balance_carry)
+            nol_balance_carry -= offset_carry
+            taxable_after_carry = sponsor_taxable_carry - offset_carry
+            tax_liab_carry = taxable_after_carry * tax_rate
+            s_tax_nol_carry = sponsor_ptc - tax_liab_carry
+        s_cf_nol_carry = s_cf_pretax + s_tax_nol_carry
+        if yr == actual_flip_year + 1 and flip_event_cf > 0:
+            s_cf_nol_carry += flip_event_cf
+        sponsor_nol_carry_cfs.append(s_cf_nol_carry)
+
+        # Unlevered Pre-Tax: Sponsor 몫, debt 효과 X, tax 효과 X
+        # = (EBITDA - aug_c) × Sponsor share — Excel Family A R27 정의
+        sponsor_unlev_pretax_cf = (ebitda - aug_c) * (1 - te_cash_pct)
+        unlev_pretax_cfs.append(sponsor_unlev_pretax_cf)
+
         if yr<=10:
             detail.append({'yr':yr,'rev':round(total_rev,0),'opex':round(opex,0),
                 'ebitda':round(ebitda,0),'ds':round(ds,0),'aug':round(aug_c,0),
@@ -826,6 +893,14 @@ def _calc_engine(inputs: dict) -> dict:
     lirr = _irr_robust(pretax_cfs, guess=0.10)   # Sponsor pretax levered (Neptune Row 26 ~10%)
     uirr = _irr_robust(unlev_cfs, guess=0.05)    # Asset-level unlevered (Neptune Row 27 ~8%)
     sirr = _irr_robust(sponsor_cfs, guess=0.10)  # Sponsor after-tax w/ MACRS (Full Life)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PHASE F — 5 IRR 카드용 IRR 계산 (2026-05-01)
+    # ═══════════════════════════════════════════════════════════════════
+    sirr_immediate = _irr_robust(sponsor_immediate_cfs, guess=0.10)  # AT Before NOL
+    sirr_nol_carry = _irr_robust(sponsor_nol_carry_cfs, guess=0.10)  # AT After NOL
+    uirr_pretax = _irr_robust(unlev_pretax_cfs, guess=0.05)          # Unlevered Pre-Tax
+
     # PHASE B — TE IRR (Tax Equity 투자자 관점 IRR)
     te_irr = _irr_robust(te_cfs_final, guess=flip_yield) if te_invest > 0 else None
     try:
@@ -879,6 +954,16 @@ def _calc_engine(inputs: dict) -> dict:
         'unlevered_irr': round(uirr,6) if (uirr is not None and not np.isnan(uirr)) else None,
         'sponsor_irr':   round(sirr,6) if (sirr is not None and not np.isnan(sirr)) else None,
         'sponsor_irr_contract': round(sirr_c,6) if (sirr_c is not None and not np.isnan(sirr_c)) else None,
+
+        # ═══════════════════════════════════════════════════════════════
+        # PHASE F — 5 IRR 카드용 (2026-05-01)
+        # Excel Family A R26/R40/R45/R27 매핑 (HWR 표준 양식)
+        # Excel Family B R22/R25/R26/R21 매핑 (BS3/Yardi 양식)
+        # ═══════════════════════════════════════════════════════════════
+        'sponsor_irr_levered_pretax':      round(lirr, 6) if (lirr is not None and not np.isnan(lirr)) else None,
+        'sponsor_irr_aftertax_before_nol': round(sirr_immediate, 6) if (sirr_immediate is not None and not np.isnan(sirr_immediate)) else None,
+        'sponsor_irr_aftertax_after_nol':  round(sirr_nol_carry, 6) if (sirr_nol_carry is not None and not np.isnan(sirr_nol_carry)) else None,
+        'sponsor_irr_unlevered_pretax':    round(uirr_pretax, 6) if (uirr_pretax is not None and not np.isnan(uirr_pretax)) else None,
         'sponsor_npv':   round(sponsor_npv,0) if sponsor_npv is not None else None,
         'project_npv':   round(project_npv,0) if project_npv is not None else None,
         'wacc':          round(wacc,6),
